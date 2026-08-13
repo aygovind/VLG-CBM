@@ -1,0 +1,135 @@
+VLG-CBM ON NRP -- SETUP AND TRAINING
+====================================
+
+This checkout is upstream Trustworthy-ML-Lab/VLG-CBM plus the changes needed to run
+BioCLIP on birds525, matching the bioclip_birds525 experiment in ../Label-free-CBM.
+Everything below is already done on the PVC; it is recorded so it can be rebuilt.
+
+
+WHAT DIFFERS FROM UPSTREAM
+--------------------------
+
+data/utils.py
+  - birds525 / birds525mini / treeoflife registered in DATASET_ROOTS and LABEL_FILES.
+  - bioclip added to get_target_model: BioCLIPBackbone exposes the image tower so
+    model.cbm.Backbone can hook visual.ln_post and read the 768-d pre-projection
+    feature, the same tap point the LF-CBM runs used. Checkpoint path comes from
+    $VLGCBM_BIOCLIP_CKPT.
+  - BACKBONE_ENCODING_DIMENSION["bioclip"] = 768.
+
+model/cbm.py
+  - Backbone.forward pooled with .mean(dim=[2,3]), which assumes a 4-D conv feature
+    map and fails on a ViT. It now dispatches on rank: spatial mean for 4-D, token
+    mean for 3-D, pass-through for the already-pooled 2-D output of visual.ln_post.
+
+scripts/generate_annotations.py
+  - --skip_existing, so a preempted annotation job resumes instead of restarting.
+    84k images is far longer than the median time to eviction on NRP.
+
+scripts/build_concept_files.py   (new)
+  - Builds <dataset>_classes.txt, _filtered.txt and _per_class.json from the LF-CBM
+    concept-set artifacts. The per-class file is what Grounding DINO turns into a
+    detection prompt and LF-CBM has no equivalent, so it is rebuilt by intersecting
+    the filtered concept set with the raw GPT-3 proposals per class.
+
+scripts/patch_groundingdino.py   (new)
+  - This container has no CUDA toolkit, so groundingdino._C never builds. Upstream
+    still dispatches to it for any GPU tensor and dies with NameError; the patch
+    dispatches on whether the extension actually imported, falling back to Grounding
+    DINO's own pure-PyTorch deformable attention.
+
+scripts/make_smoke_dataset.sh    (new)
+  - birds525mini: first 5 classes of birds525, symlinked. Annotate + train in minutes.
+
+configs/birds525_bioclip.json, configs/birds525mini_bioclip.json   (new)
+k8s/job-annotate-birds525.yaml, k8s/job-train-bioclip-birds525.yaml (new)
+
+
+ENVIRONMENT (already built at /workspace/envs/vlgcbm)
+-----------------------------------------------------
+
+source /opt/conda/etc/profile.d/conda.sh
+conda create -p /workspace/envs/vlgcbm python=3.12 -y
+conda activate /workspace/envs/vlgcbm
+
+pip install -r requirements.txt
+pip install open_clip_torch ftfy regex                      # BioCLIP backbone
+pip install transformers==4.44.2 addict yapf timm supervision pycocotools
+
+# the vendored clip/clip.py imports pkg_resources, which setuptools>=81 removed
+pip install "setuptools<81"
+
+# Grounding DINO, installed under the repo root where generate_annotations expects it
+git clone https://github.com/IDEA-Research/GroundingDINO.git
+cd GroundingDINO
+pip install -e . --no-build-isolation --no-deps          # builds without _C, no nvcc here
+wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
+cd ..
+python scripts/patch_groundingdino.py --groundingdino_dir GroundingDINO
+
+
+DATA
+----
+
+export DATASET_FOLDER=/workspace/VLG-CBM/datasets
+mkdir -p datasets
+ln -sfn /workspace/Label-free-CBM/data/birds525 datasets/birds525
+ln -sfn /workspace/Label-free-CBM/data/treeoflife datasets/treeoflife
+
+python -m scripts.build_concept_files --dataset birds525 --lfcbm_dir /workspace/Label-free-CBM
+# -> 525 classes, 2012 concepts, 10-26 concepts per class prompt
+
+
+RESTART
+-------
+
+cd /workspace/VLG-CBM
+source /opt/conda/etc/profile.d/conda.sh
+conda activate /workspace/envs/vlgcbm
+export DATASET_FOLDER=/workspace/VLG-CBM/datasets
+export VLGCBM_BIOCLIP_CKPT=/workspace/models/bioclip/open_clip_pytorch_model.bin
+export TOKENIZERS_PARALLELISM=false
+
+
+SMOKE TEST (~15 min end to end, do this after any change)
+----------------------------------------------------------
+
+bash scripts/make_smoke_dataset.sh 5
+python -m scripts.build_concept_files --dataset birds525 --name birds525mini \
+    --max_classes 5 --lfcbm_dir /workspace/Label-free-CBM
+for split in val train; do
+  python -m scripts.generate_annotations --dataset "birds525mini_$split" --device cuda \
+      --batch_size 2 --num_workers 4 --text_threshold 0.15 --output_dir annotations --skip_existing
+done
+python train_cbm.py --config configs/birds525mini_bioclip.json --annotation_dir annotations
+
+
+ANNOTATION (prerequisite for birds525; ~4-10 GPU-hours)
+--------------------------------------------------------
+
+VLG-CBM publishes annotations for cifar10/100, cub, places365 and imagenet only, so
+birds525 has to be generated. 87,260 images through Grounding DINO SwinB at 800x800.
+
+kubectl apply -f k8s/job-annotate-birds525.yaml
+kubectl logs -f job/vlgcbm-annotate-birds525
+kubectl get pods -l run=annotate-birds525 -w
+
+Resumes on eviction. Do not run two against the same output dir.
+
+
+TRAIN
+-----
+
+kubectl apply -f k8s/job-train-bioclip-birds525.yaml
+kubectl logs -f job/vlgcbm-bioclip-birds525
+kubectl get pods -l run=bioclip-birds525 -w
+
+Or interactively on the jupyter pod:
+
+python train_cbm.py --config configs/birds525_bioclip.json --annotation_dir annotations
+
+
+EVALUATE
+--------
+
+python sparse_evaluation.py --load_path saved_models/birds525_bioclip/<run-dir> --lam 0.0002

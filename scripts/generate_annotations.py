@@ -238,6 +238,11 @@ def main():
     parser.add_argument("--dataset", type=str, default="cifar10_train", help="dataset name")
     parser.add_argument("--device", type=str, default="cuda", help="running on cpu only!, default=False")
     parser.add_argument("--save_image", action="store_true", help="save image")
+    parser.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help="skip images that already have an annotation json, so a preempted run can resume",
+    )
     args = parser.parse_args()
 
     # cfg
@@ -307,7 +312,18 @@ def main():
         print(f"Prompt for class {class_name}: {prompt}")
 
         # only load images with class_idx
-        dataset_subset = torch.utils.data.Subset(dataset, np.where(np.array(dataset.targets) == class_idx)[0])
+        class_indices = np.where(np.array(dataset.targets) == class_idx)[0]
+        if args.skip_existing:
+            # NRP preemption kills long annotation jobs part-way through, and a
+            # written .json is a finished image, so a resumed run only has to
+            # cover what is missing.
+            todo = [i for i in class_indices if not os.path.exists(os.path.join(output_dir, f"{i}.json"))]
+            if len(todo) < len(class_indices):
+                print(f"Skipping {len(class_indices) - len(todo)} already-annotated images in class {class_name}")
+            if not todo:
+                continue
+            class_indices = np.array(todo)
+        dataset_subset = torch.utils.data.Subset(dataset, class_indices)
         dataloader = torch.utils.data.DataLoader(
             dataset_subset,
             batch_size=batch_size,

@@ -1,0 +1,143 @@
+# VLG-CBM with a BioCLIP backbone on birds525 -- the counterpart to bioclip_birds525
+# in the Label-free-CBM repo, so the two are directly comparable: same dataset, same
+# 768-d visual.ln_post tap, same concept set. What differs is where concept labels
+# come from -- Grounding DINO boxes here, CLIP text similarity there.
+#
+# Requires k8s/job-annotate-birds525.yaml to have finished; the preflight checks that.
+#
+# Cost: CBL training dominates. 76k train images x 20 epochs at batch 32, with the
+# backbone frozen, so it is JPEG-decode bound more than GPU bound -- expect ~3-5h,
+# plus ~30min for GLM-SAGA on the cached concept features.
+#
+# Submit:  kubectl apply -f k8s/job-train-bioclip-birds525.yaml
+# Watch:   kubectl logs -f job/vlgcbm-bioclip-birds525
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-bioclip-birds525
+  labels:
+    app: vlgcbm
+    run: bioclip-birds525
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 172800    # 48h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: bioclip-birds525
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: trainer
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - name: HF_HOME
+              value: /workspace/.cache/huggingface
+            - name: TORCH_HOME
+              value: /workspace/.cache/torch
+            - name: PIP_CACHE_DIR
+              value: /workspace/.cache/pip
+            - name: DATASET_FOLDER
+              value: /workspace/VLG-CBM/datasets
+            - name: VLGCBM_BIOCLIP_CKPT
+              value: /workspace/models/bioclip/open_clip_pytorch_model.bin
+            - name: CONFIG
+              value: configs/birds525_bioclip.json
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+
+              echo "===== environment ====="
+              nvidia-smi
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
+
+              echo "===== code version ====="
+              git rev-parse HEAD
+              git status --short || true
+
+              echo "===== preflight ====="
+              test -f "$VLGCBM_BIOCLIP_CKPT" || { echo "FATAL: missing BioCLIP checkpoint"; exit 1; }
+              for split in train val; do
+                n_img=$(find "datasets/birds525/$split" -name '*.jpg' | wc -l)
+                n_ann=$(ls "annotations/birds525_$split" 2>/dev/null | wc -l)
+                echo "birds525_$split: $n_img images, $n_ann annotations"
+                # ConceptDataset indexes annotations by dataset position, so a missing
+                # json is a hard KeyError mid-epoch rather than a skipped sample
+                test "$n_img" -eq "$n_ann" \
+                  || { echo "FATAL: annotation count != image count for $split; rerun the annotation job"; exit 1; }
+              done
+              # confirm BioCLIP loads and taps out at 768-d before committing GPU hours
+              python -c "
+              import torch
+              from model.cbm import Backbone
+              bb = Backbone('bioclip', 'visual.ln_post', 'cuda')
+              with torch.no_grad():
+                  f = bb(torch.randn(2, 3, 224, 224).cuda())
+              assert f.shape == (2, 768), f.shape
+              print('bioclip backbone ok:', tuple(f.shape))
+              "
+              echo "PVC free space:"; df -h /workspace | tail -1
+
+              echo "===== training: $CONFIG ====="
+              python train_cbm.py --config "$CONFIG" --annotation_dir annotations
+          volumeMounts:
+            - name: ml-storage
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "8"
+              memory: "20Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "9"
+              memory: "24Gi"
+              ephemeral-storage: "12Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim:
+            claimName: ayush-workspace
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # BioCLIP ViT-B/16 is frozen here, so 11GB is plenty -- the same
+                  # pool the LF-CBM backbone-comparison job used.
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-L4
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-RTX-A4000
+                      - Tesla-V100-SXM2-16GB
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - Tesla-V100-PCIE-16GB
+                      - NVIDIA-TITAN-RTX
+                      - NVIDIA-RTX-A5000
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-4000-Ada-Generation

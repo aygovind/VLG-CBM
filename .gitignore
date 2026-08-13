@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Grounding DINO is cloned in-tree (generate_annotations imports it by that path)
+# and carries a ~900MB checkpoint; it is set up by setup.txt, not vendored here.
+/GroundingDINO/
+
+# Generated on the PVC, not source: dataset symlinks, per-image annotation json,
+# trained models and cached concept features.
+/datasets/
+/annotations/
+/annotations_smoke/
+/saved_models/

@@ -1,0 +1,145 @@
+# Grounding DINO annotation pass over birds525 -- the prerequisite for every VLG-CBM
+# run on this dataset. VLG-CBM ships annotations for cifar10/100, cub, places365 and
+# imagenet only, so birds525 has to be generated.
+#
+# Cost: 84,635 train + 2,625 val images at 800x800 through Grounding DINO SwinB.
+# Measured ~2.3 img/s on a (shared) 2080-Ti, so ~10h there; the node affinity below
+# asks for >=24GB Turing-or-newer cards, where it should be ~3-4h. Output is ~6KB of
+# json per image, so ~550MB total.
+#
+# --skip_existing makes a preempted run resume: a written .json is a finished image.
+# Do NOT run two of these against the same output_dir concurrently.
+#
+# Submit:  kubectl apply -f k8s/job-annotate-birds525.yaml
+# Watch:   kubectl logs -f job/vlgcbm-annotate-birds525
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-annotate-birds525
+  labels:
+    app: vlgcbm
+    run: annotate-birds525
+spec:
+  backoffLimit: 4                  # evictions are likely; --skip_existing makes a retry resume
+  activeDeadlineSeconds: 172800    # 48h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: annotate-birds525
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: annotator
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - name: HF_HOME
+              value: /workspace/.cache/huggingface
+            - name: TORCH_HOME
+              value: /workspace/.cache/torch
+            - name: PIP_CACHE_DIR
+              value: /workspace/.cache/pip
+            - name: DATASET_FOLDER
+              value: /workspace/VLG-CBM/datasets
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+
+              echo "===== environment ====="
+              nvidia-smi
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
+
+              echo "===== code version ====="
+              git rev-parse HEAD
+              git status --short || true
+
+              echo "===== preflight ====="
+              # the compiled CUDA op is absent on this image (no nvcc); the patch makes
+              # the pure-PyTorch deformable attention take over instead of crashing
+              python -c "
+              from groundingdino.models.GroundingDINO.ms_deform_attn import _C_AVAILABLE
+              print('groundingdino _C extension available:', _C_AVAILABLE)
+              " || { echo 'FATAL: run scripts/patch_groundingdino.py first'; exit 1; }
+              test -f GroundingDINO/groundingdino_swinb_cogcoor.pth \
+                || { echo 'FATAL: missing Grounding DINO checkpoint'; exit 1; }
+              for f in concept_files/birds525_classes.txt concept_files/birds525_per_class.json; do
+                test -f "$f" || { echo "FATAL: missing $f -- run scripts/build_concept_files.py"; exit 1; }
+              done
+              for d in datasets/birds525/train datasets/birds525/val; do
+                test -d "$d" || { echo "FATAL: missing $d"; exit 1; }
+              done
+              echo "PVC free space:"; df -h /workspace | tail -1
+
+              # val first: 2,625 images, so any bug surfaces in minutes rather than hours
+              for split in val train; do
+                echo "===== annotating birds525_$split ====="
+                python -m scripts.generate_annotations \
+                  --dataset "birds525_$split" \
+                  --device cuda \
+                  --batch_size 8 \
+                  --num_workers 6 \
+                  --text_threshold 0.15 \
+                  --output_dir annotations \
+                  --skip_existing
+                echo "birds525_$split annotations: $(ls annotations/birds525_$split | wc -l)"
+              done
+          volumeMounts:
+            - name: ml-storage
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "7"
+              memory: "20Gi"
+              ephemeral-storage: "12Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim:
+            claimName: ayush-workspace
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # >=24GB and Turing-or-newer. Grounding DINO SwinB at 800x800 needs
+                  # ~1.2GB per image in the batch, so batch_size 8 wants ~11GB with
+                  # headroom -- an 11GB 2080-Ti fits but has no room to spare and is
+                  # ~3x slower than these.
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-32GB

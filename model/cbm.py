@@ -106,7 +106,14 @@ class Backbone(nn.Module):
 
     def forward(self, x):
         out = self.backbone(x)
-        return self.feature_vals[out.device].mean(dim=[2, 3])
+        feats = self.feature_vals[out.device]
+        if feats.dim() == 4:  # (B, C, H, W) conv map -> spatial average pool
+            return feats.mean(dim=[2, 3])
+        if feats.dim() == 3:  # (B, tokens, D) ViT tokens -> pool over tokens
+            # open_clip applies ln_post after pooling on current versions, so this
+            # branch only fires on older ones that hand back the token sequence.
+            return feats.mean(dim=1).float()
+        return feats.float()  # already pooled, e.g. BioCLIP's visual.ln_post
 
     def save_model(self, save_dir):
         torch.save(self.backbone.state_dict(), os.path.join(save_dir, "backbone.pt"))

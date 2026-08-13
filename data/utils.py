@@ -15,11 +15,27 @@ from PIL import Image
 # get from the environment variable
 DATASET_FOLDER = os.environ.get("DATASET_FOLDER", "datasets")
 
+# BioCLIP is not on any hub we can reach from the cluster, so the checkpoint is
+# staged on the PVC and located by env var (same convention as the LF-CBM repo).
+BIOCLIP_CKPT = os.environ.get("VLGCBM_BIOCLIP_CKPT", "/workspace/models/bioclip/open_clip_pytorch_model.bin")
+
 DATASET_ROOTS = {
     "imagenet_train": f"{DATASET_FOLDER}/imagenet/ILSVRC/Data/CLS-LOC/train",
     "imagenet_val": f"{DATASET_FOLDER}/imagenet/ILSVRC/Data/CLS-LOC/ImageNet_val",
     "cub_train": f"{DATASET_FOLDER}/CUB/train",
     "cub_val": f"{DATASET_FOLDER}/CUB/test",
+    # Datasets carried over from the LF-CBM experiments. `_val` is what VLG-CBM
+    # calls the test set; the validation split is carved out of `_train` by
+    # get_concept_dataloader using args.val_split.
+    "birds525_train": f"{DATASET_FOLDER}/birds525/train",
+    "birds525_val": f"{DATASET_FOLDER}/birds525/val",
+    "treeoflife_train": f"{DATASET_FOLDER}/treeoflife/train",
+    "treeoflife_val": f"{DATASET_FOLDER}/treeoflife/val",
+    # First 5 classes of birds525, symlinked. Annotating and training on it takes
+    # minutes, so it is the end-to-end check to run before the multi-hour birds525
+    # jobs. See scripts/make_smoke_dataset.sh.
+    "birds525mini_train": f"{DATASET_FOLDER}/birds525mini/train",
+    "birds525mini_val": f"{DATASET_FOLDER}/birds525mini/val",
 }
 
 LABEL_FILES = {
@@ -32,6 +48,9 @@ LABEL_FILES = {
     "flower": "concept_files/flower_classes.txt",
     "aircraft": "concept_files/aircraft_classes.txt",
     "dtd": "concept_files/dtd_classes.txt",
+    "birds525": "concept_files/birds525_classes.txt",
+    "birds525mini": "concept_files/birds525mini_classes.txt",
+    "treeoflife": "concept_files/treeoflife_classes.txt",
 }
 
 BACKBONE_ENCODING_DIMENSION = {
@@ -39,6 +58,9 @@ BACKBONE_ENCODING_DIMENSION = {
     "clip_RN50": 1024,
     "clip_RN50_penultimate": 2048,
     "resnet50": 2048,
+    # BioCLIP is ViT-B/16: 768-d pre-projection features out of visual.ln_post,
+    # not the 512-d output of encode_image.
+    "bioclip": 768,
 }
 
 BACKBONE_VISUALIZATION_TARGET_LAYER = {
@@ -211,8 +233,44 @@ def get_targets_only(dataset_name):
     return pil_data.targets
 
 
+class BioCLIPBackbone(torch.nn.Module):
+    """BioCLIP's image tower, tapped at visual.ln_post.
+
+    Returns the 768-d pre-projection features instead of the 512-d output of
+    encode_image, so the concept layer sees the true penultimate layer. Kept as
+    a Module (not a lambda) so model.cbm.Backbone can resolve the
+    `visual.ln_post` attribute path when registering its own hook.
+    """
+
+    def __init__(self, clip_model):
+        super().__init__()
+        self.visual = clip_model.visual
+
+    def forward(self, x):
+        # ln_post's output is what Backbone hooks; the return value only has to
+        # live on the right device for Backbone to look the hook result up.
+        return self.visual(x).float()
+
+
+def load_bioclip(device):
+    """Load the BioCLIP ViT-B/16 checkpoint into an open_clip model."""
+    import open_clip
+
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-16")
+    checkpoint = torch.load(BIOCLIP_CKPT, map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    state_dict = {k.replace("module.", "", 1) if k.startswith("module.") else k: v for k, v in state_dict.items()}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    assert not missing and not unexpected, (missing[:5], unexpected[:5])
+    return model, preprocess
+
+
 def get_target_model(target_name, device):
-    if target_name.startswith("clip_"):
+    if target_name == "bioclip":
+        model, preprocess = load_bioclip(device)
+        target_model = BioCLIPBackbone(model).to(device).eval()
+
+    elif target_name.startswith("clip_"):
         target_name = target_name[5:]
         model, preprocess = clip.load(target_name, device=device)
         target_model = lambda x: model.encode_image(x).float()
