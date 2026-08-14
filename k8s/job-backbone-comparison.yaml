@@ -74,6 +74,15 @@ spec:
             - |
               set -eo pipefail
 
+              # Mirror everything to the PVC. kubectl logs dials the node's kubelet and
+              # some NRP nodes do not answer from outside their site, which leaves a
+              # multi-hour job unobservable; a file on shared storage survives that, and
+              # survives the pod being garbage collected afterwards.
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/backbone-comparison-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
               echo "===== environment ====="
               nvidia-smi
               source /opt/conda/etc/profile.d/conda.sh
@@ -156,6 +165,15 @@ spec:
               - matchExpressions:
                   # Every backbone is frozen, so 11GB suffices. Same pool the LF-CBM
                   # backbone-comparison job used: Turing-or-newer, tensor cores present.
+                  # kubectl logs and kubectl exec both dial the node's kubelet on :10250.
+                  # v100-cc-star-01 does not answer on that port from outside its site, so
+                  # a job landing there runs fine but is completely unobservable -- and the
+                  # RWO volume means no second pod can read the PVC while it holds it.
+                  # Add hosts here if the same thing happens elsewhere.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
