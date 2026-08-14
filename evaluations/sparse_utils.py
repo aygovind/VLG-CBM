@@ -165,6 +165,9 @@ def sparsity_acc_test(load_dir, lam_max=0.1, bot_filter=0, anno=None):
         if os.path.exists(os.path.join(load_dir, "train_concept_features.pt"))
         else None,
         batch_size=args.saga_batch_size,
+        # Pass the device explicitly. get_final_layer_dataset defaults it to "cuda" and now
+        # puts the concept features there, so leaving it implicit would ignore --device.
+        device=args.device,
         filter=filtered_idx,
     )
     normalization = NormalizationLayer.from_pretrained(load_dir, args.device)
