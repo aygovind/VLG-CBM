@@ -358,6 +358,17 @@ def get_final_layer_dataset(
     if filter is not None:
         train_concept_features = train_concept_features[:, filter]
         val_concept_features = val_concept_features[:, filter]
+    # Keep the concept features GPU-resident for the SAGA path. Left on the CPU every
+    # batch of every iteration crosses the bus and the solver stalls on a single-threaded
+    # loader; measured on birds525/bioclip, this stage was 109 of the run's 244 minutes,
+    # and unlike CBL training it does not shrink when cbl_epochs is lowered. The matrices
+    # are small enough to sit on the card: 76k x 1911 float32 is 582MB (65MB for val).
+    # Note: glm saga expects y to be on CPU -- it builds its one-hot targets with `I[y]`
+    # against a CPU identity matrix (elasticnet.py:321), so CUDA label indices raise
+    # "indices should be either on cpu or on the same device". Move features only.
+    # Done after the torch.save calls above so the checkpoints stay CPU tensors.
+    train_concept_features = train_concept_features.to(device)
+    val_concept_features = val_concept_features.to(device)
     # Note: glm saga expects y to be on CPU
     train_concept_dataset = IndexedTensorDataset(train_concept_features, train_concept_labels)
     val_concept_dataset = TensorDataset(val_concept_features, val_concept_labels)

@@ -110,10 +110,13 @@ class Backbone(nn.Module):
         if feats.dim() == 4:  # (B, C, H, W) conv map -> spatial average pool
             return feats.mean(dim=[2, 3])
         if feats.dim() == 3:  # (B, tokens, D) ViT tokens -> pool over tokens
-            # open_clip applies ln_post after pooling on current versions, so this
-            # branch only fires on older ones that hand back the token sequence.
+            # This is the branch BioCLIP takes: open_clip's visual.ln_post runs before
+            # pooling, so the hook sees all 197 tokens (CLS + 196 patches). Averaging
+            # them matches what the LF-CBM BioCLIPBackbone did, which is what keeps the
+            # two sets of results comparable. model.utils.get_activation pools the same
+            # way so the black-box baselines see the same feature.
             return feats.mean(dim=1).float()
-        return feats.float()  # already pooled, e.g. BioCLIP's visual.ln_post
+        return feats.float()  # already pooled, e.g. TimmBackbone's `out` Identity
 
     def save_model(self, save_dir):
         torch.save(self.backbone.state_dict(), os.path.join(save_dir, "backbone.pt"))

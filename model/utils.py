@@ -158,11 +158,19 @@ def get_activation(outputs, mode):
     mode: how to pool activations: one of avg, max
     for fc neurons does no pooling
     """
+    # The 3-D case is ViT tokens, (B, tokens, D). Without it a hook on a pre-pool layer
+    # such as BioCLIP's visual.ln_post -- which open_clip runs before pooling, so it emits
+    # all 197 tokens -- appends nothing at all, and save_target_activations dies on
+    # torch.cat of an empty list after the whole dataset has been pushed through.
+    # Pooling over tokens here matches model.cbm.Backbone.forward, so the black-box
+    # baseline and the CBM see the same feature.
     if mode == "avg":
 
         def hook(model, input, output):
             if len(output.shape) == 4:
                 outputs.append(output.mean(dim=[2, 3]).detach().cpu())
+            elif len(output.shape) == 3:
+                outputs.append(output.mean(dim=1).detach().cpu())
             elif len(output.shape) == 2:
                 outputs.append(output.detach().cpu())
 
@@ -171,6 +179,8 @@ def get_activation(outputs, mode):
         def hook(model, input, output):
             if len(output.shape) == 4:
                 outputs.append(output.amax(dim=[2, 3]).detach().cpu())
+            elif len(output.shape) == 3:
+                outputs.append(output.amax(dim=1).detach().cpu())
             elif len(output.shape) == 2:
                 outputs.append(output.detach().cpu())
 

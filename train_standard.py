@@ -102,7 +102,10 @@ def train_and_save(args):
     W_g = W_g.to(args.device)
     
     save_name = "{}/{}_finetuned_{}".format(args.save_dir, args.dataset, datetime.datetime.now().strftime("%Y_%m_%d_%H_%M"))
-    os.mkdir(save_name)
+    # makedirs, not mkdir: --save_dir is a per-backbone directory that does not exist on
+    # the first run, and mkdir only creates the leaf. This fires after training, so the
+    # crash would land at the end of the run and throw the work away.
+    os.makedirs(save_name, exist_ok=True)
     torch.save(train_mean, os.path.join(save_name, "proj_mean.pt"))
     torch.save(train_std, os.path.join(save_name, "proj_std.pt"))
     torch.save(W_g, os.path.join(save_name, "W_g.pt"))
