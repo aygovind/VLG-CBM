@@ -12,10 +12,21 @@
 # Requires k8s/job-annotate-birds525.yaml to have finished, and timm in the env.
 # Preflight checks both.
 #
-# Cost: ~30min per standard run and ~4h per CBM run, so ~23h for the full suite. The
-# standard runs go first: they exercise the same backbone-loading path for a fraction of
-# the time, so a broken backbone surfaces within the hour instead of four hours deep.
-# --skip_existing makes an evicted job resume at run granularity.
+# Cost: measured on the completed birds525/bioclip run, a CBM run is 10min concept
+# filtering + 6.2min per CBL epoch + ~109min for the final layer. At cbl_epochs 10, and
+# with the concept features now GPU-resident for SAGA, expect ~1.5-2h per CBM run and
+# ~30min per standard run, so roughly 8-12h for the suite.
+#
+# cbl_epochs is 10 because epochs are the wrong unit: birds525 is 2,381 steps/epoch
+# against CUB's 169, so 10 epochs here is 23,810 steps -- 1.9x the 12,675 steps upstream
+# used for CUB's 75. The first birds525 run was flat in both train and val loss from
+# epoch 2 of 20.
+#
+# The standard runs go first: they exercise the same backbone-loading path for a fraction
+# of the time, so a broken backbone surfaces within the hour instead of hours deep.
+# --skip_existing makes an evicted job resume at run granularity -- which also means a
+# finished run is skipped even if its config has since changed. See the note in
+# run_suite.is_complete.
 #
 # Submit:  kubectl apply -f k8s/job-backbone-comparison.yaml
 # Watch:   kubectl logs -f job/vlgcbm-backbone-comparison

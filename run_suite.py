@@ -93,6 +93,32 @@ def is_complete(kind, name):
     return False
 
 
+def stale_against_config(kind, name):
+    """Hyperparameters where a finished run disagrees with the config it would run under.
+
+    --skip_existing keys on "a metrics.txt exists", so a run finished under different
+    settings is skipped and silently stays in the results at those settings. In a suite
+    whose whole point is that only the backbone varies, that is the failure worth
+    shouting about: it does not crash, it just quietly produces a comparison that is not
+    controlled. train_cbm.py dumps the settings it used to args.txt, so they can be
+    compared directly.
+    """
+    if kind != "cbm":
+        return {}
+    root = save_dir_for(kind, name)
+    with open(config_path(name)) as f:
+        cfg = json.load(f)
+    for entry in sorted(os.listdir(root)):
+        args_path = os.path.join(root, entry, "args.txt")
+        if not (os.path.exists(args_path) and os.path.exists(os.path.join(root, entry, "metrics.txt"))):
+            continue
+        with open(args_path) as f:
+            used = json.load(f)
+        return {k: (used[k], v) for k, v in cfg.items()
+                if k in used and used[k] != v and k not in ("save_dir", "load_dir", "annotation_dir")}
+    return {}
+
+
 def command_for(kind, name, annotation_dir):
     if kind == "cbm":
         return [sys.executable, "train_cbm.py", "--config", config_path(name),
@@ -125,6 +151,7 @@ def main():
     check_consistency()
     runs = SUITES[args.suite]
     failures = []
+    stale_skips = []
 
     for i, (kind, name) in enumerate(runs, 1):
         tag = f"[{i}/{len(runs)}] {kind}:{name}"
@@ -135,7 +162,16 @@ def main():
             continue
 
         if args.skip_existing and is_complete(kind, name):
-            print(f"{tag} already complete -- skipping", flush=True)
+            stale = stale_against_config(kind, name)
+            if stale:
+                diffs = ", ".join(f"{k}: on disk {was!r} != config {now!r}" for k, (was, now) in stale.items())
+                print(f"{tag} already complete -- skipping, but IT DOES NOT MATCH THE CONFIG: {diffs}",
+                      flush=True)
+                print(f"{' ' * len(tag)}   the suite will compare it against runs trained differently; "
+                      f"move {save_dir_for(kind, name)} aside to redo it", flush=True)
+                stale_skips.append(f"{kind}:{name}")
+            else:
+                print(f"{tag} already complete -- skipping", flush=True)
             continue
 
         print(f"\n{'=' * 70}\n{tag}\n$ {' '.join(cmd)}\n{'=' * 70}", flush=True)
@@ -151,6 +187,9 @@ def main():
         else:
             print(f"{tag} finished in {elapsed:.0f} min", flush=True)
 
+    if stale_skips:
+        print(f"\nWARNING: {len(stale_skips)} run(s) skipped despite not matching the current "
+              f"config: {', '.join(stale_skips)}")
     if failures:
         print(f"\n{len(failures)} run(s) failed: {', '.join(failures)}")
         sys.exit(1)
