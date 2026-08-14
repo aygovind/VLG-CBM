@@ -68,13 +68,22 @@ def train_and_save(args):
         train_mean = torch.mean(train_c, dim=0, keepdim=True)
         train_std = torch.std(train_c, dim=0, keepdim=True)
 
-        train_z = (train_c-train_mean)/train_std
+        # Keep the features resident on the GPU. Left on the CPU, every batch of every
+        # SAGA iteration is copied across the bus and the solver stalls on a
+        # single-threaded loader -- measured at 12% GPU utilisation in the LF-CBM repo,
+        # which is both slow and below the NRP 40% floor. SAGA is this script's entire
+        # workload, so that is the whole run. birds525 is 260MB at 768-d, 693MB for
+        # resnet50's 2048-d.
+        # Features move to the GPU; labels must NOT. glm_saga builds its one-hot targets
+        # with `I[y]` against a CPU identity matrix (elasticnet.py:321), so CUDA label
+        # indices raise "indices should be either on cpu or on the same device".
+        train_z = ((train_c-train_mean)/train_std).to(args.device)
         labels = data_t.targets
         train_y = torch.LongTensor(labels)
 
         indexed_train_ds = IndexedTensorDataset(train_z,train_y)
 
-        val_z = (val_c-train_mean)/train_std
+        val_z = ((val_c-train_mean)/train_std).to(args.device)
         val_labels = val_data_t.targets
         val_y = torch.LongTensor(val_labels)
 
