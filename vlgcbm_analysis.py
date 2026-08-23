@@ -151,10 +151,13 @@ def load_run(load_dir, device=None):
 
     normalization = NormalizationLayer.from_pretrained(load_dir, device=device)
 
-    classes = _load_classes(load_dir, train_args["dataset"], -1)
-    final = FinalLayer(len(concepts), len(classes), device=device)
-    final.load_state_dict(torch.load(os.path.join(load_dir, "final.pt"), map_location=device))
-    _load_classes(load_dir, train_args["dataset"], final.weight.shape[0])
+    # Size the final layer from the checkpoint rather than from the label file, so the
+    # class names are checked against what the model actually outputs instead of
+    # deciding it.
+    final_state = torch.load(os.path.join(load_dir, "final.pt"), map_location=device)
+    classes = _load_classes(load_dir, train_args["dataset"], final_state["weight"].shape[0])
+    final = FinalLayer(len(concepts), final_state["weight"].shape[0], device=device)
+    final.load_state_dict(final_state)
 
     model = VLGCBM(backbone, cbl, normalization, final).to(device).eval()
     return Run(load_dir, model, concepts, classes, train_args, backbone.preprocess, device)
