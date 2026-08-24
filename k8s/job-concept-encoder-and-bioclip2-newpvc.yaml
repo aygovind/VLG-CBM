@@ -25,7 +25,13 @@
 #
 # Estimated ~23-25h total; see the per-run table in the accompanying notes.
 #
-# Submit:  kubectl apply -f k8s/job-concept-encoder-and-bioclip2.yaml
+# Also mounts the old ayush-workspace PVC (read-only) and copies birds525 images,
+# annotations and the BioCLIP checkpoint onto vlgcbm-workspace before anything else runs
+# -- `cp -n` skips files already present, so this resumes rather than restarting if the
+# pod is evicted mid-copy. Both PVCs are RWO, so nothing else may hold ayush-workspace
+# while this job runs (e.g. jupyter-gpu-pod must stay down).
+#
+# Submit:  kubectl apply -f k8s/job-concept-encoder-and-bioclip2-newpvc.yaml
 # Watch:   kubectl logs -f job/vlgcbm-concept-encoder-bioclip2
 apiVersion: batch/v1
 kind: Job
@@ -83,11 +89,29 @@ spec:
               source /opt/conda/etc/profile.d/conda.sh
 
               # ---------------------------------------------------------------
-              # Preflight: BioCLIP 2 is the only genuinely new thing here, and it
+              # Preflight 0: finish populating vlgcbm-workspace from the old PVC.
+              # -n skips anything already copied, so an evicted retry resumes rather
+              # than starting over. Small-file copy over this storage is slow --
+              # expect this step alone to take a while on a cold start.
+              # ---------------------------------------------------------------
+              echo "===== preflight: copying data from /old ====="
+              mkdir -p /workspace/models /workspace/Label-free-CBM/data /workspace/VLG-CBM/annotations
+              cp -an /old/models/bioclip/. /workspace/models/bioclip/
+              cp -an /old/Label-free-CBM/data/birds525/. /workspace/Label-free-CBM/data/birds525/
+              cp -an /old/Label-free-CBM/data/treeoflife/. /workspace/Label-free-CBM/data/treeoflife/
+              cp -an /old/VLG-CBM/annotations/. /workspace/VLG-CBM/annotations/
+              echo "copy done: $(find /workspace/Label-free-CBM/data/birds525 -type f | wc -l) birds525 files, " \
+                   "$(find /workspace/VLG-CBM/annotations -type f | wc -l) annotation files"
+
+              # ---------------------------------------------------------------
+              # Preflight 1: BioCLIP 2 is the only genuinely new thing here, and it
               # is a ~1.7GB HF download. Fail now, not six hours in.
               # ---------------------------------------------------------------
               conda activate /workspace/envs/vlgcbm
               cd /workspace/VLG-CBM
+              mkdir -p datasets
+              ln -sfn /workspace/Label-free-CBM/data/birds525 datasets/birds525
+              ln -sfn /workspace/Label-free-CBM/data/treeoflife datasets/treeoflife
               echo "===== code version (VLG-CBM) ====="
               git rev-parse HEAD; git status --short || true
 
@@ -157,6 +181,9 @@ spec:
           volumeMounts:
             - name: ml-storage
               mountPath: /workspace
+            - name: old-storage
+              mountPath: /old
+              readOnly: true
             - name: dshm
               mountPath: /dev/shm
           resources:
@@ -174,6 +201,10 @@ spec:
         - name: ml-storage
           persistentVolumeClaim:
             claimName: vlgcbm-workspace
+        - name: old-storage
+          persistentVolumeClaim:
+            claimName: ayush-workspace
+            readOnly: true
         - name: dshm
           emptyDir:
             medium: Memory
