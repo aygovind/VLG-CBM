@@ -25,11 +25,14 @@
 #
 # Estimated ~23-25h total; see the per-run table in the accompanying notes.
 #
-# Also mounts the old ayush-workspace PVC (read-only) and copies birds525 images,
-# annotations and the BioCLIP checkpoint onto vlgcbm-workspace before anything else runs
-# -- `cp -n` skips files already present, so this resumes rather than restarting if the
-# pod is evicted mid-copy. Both PVCs are RWO, so nothing else may hold ayush-workspace
-# while this job runs (e.g. jupyter-gpu-pod must stay down).
+# Runs entirely on vlgcbm-workspace and does NOT mount ayush-workspace. The birds525
+# images, annotations and BioCLIP checkpoint were copied over once by an earlier job run
+# and already live on this PVC -- an earlier version of this file mounted the old PVC to
+# do that copy itself, but since it is RWO that meant holding it, read-only or not, for
+# this job's entire runtime, which blocked jupyter-gpu-pod (or anything else) from
+# attaching ayush-workspace for as long as this job ran. The whole point of a second PVC
+# was to keep the first one free, so that mount is gone; the preflight below just checks
+# the data is present and fails loudly if it somehow is not.
 #
 # Submit:  kubectl apply -f k8s/job-concept-encoder-and-bioclip2-newpvc.yaml
 # Watch:   kubectl logs -f job/vlgcbm-concept-encoder-bioclip2
@@ -89,19 +92,23 @@ spec:
               source /opt/conda/etc/profile.d/conda.sh
 
               # ---------------------------------------------------------------
-              # Preflight 0: finish populating vlgcbm-workspace from the old PVC.
-              # -n skips anything already copied, so an evicted retry resumes rather
-              # than starting over. Small-file copy over this storage is slow --
-              # expect this step alone to take a while on a cold start.
+              # Preflight 0: the PVC-to-PVC copy from ayush-workspace already ran to
+              # completion in an earlier attempt (89,885 birds525 files, 88,096
+              # annotation files -- exact match to source). This job no longer mounts
+              # that PVC at all: it is RWO, so holding it for this job's full runtime
+              # would block any other pod (e.g. jupyter-gpu-pod) from attaching it for
+              # as long as this job runs. Just verify vlgcbm-workspace already has what
+              # it needs, and fail loudly rather than silently training on nothing if
+              # a future rebase of this job runs before that copy has happened.
               # ---------------------------------------------------------------
-              echo "===== preflight: copying data from /old ====="
-              mkdir -p /workspace/models /workspace/Label-free-CBM/data /workspace/VLG-CBM/annotations
-              cp -an /old/models/bioclip/. /workspace/models/bioclip/
-              cp -an /old/Label-free-CBM/data/birds525/. /workspace/Label-free-CBM/data/birds525/
-              cp -an /old/Label-free-CBM/data/treeoflife/. /workspace/Label-free-CBM/data/treeoflife/
-              cp -an /old/VLG-CBM/annotations/. /workspace/VLG-CBM/annotations/
-              echo "copy done: $(find /workspace/Label-free-CBM/data/birds525 -type f | wc -l) birds525 files, " \
-                   "$(find /workspace/VLG-CBM/annotations -type f | wc -l) annotation files"
+              echo "===== preflight: checking data is already on this PVC ====="
+              test -f /workspace/models/bioclip/open_clip_pytorch_model.bin \
+                || { echo "FATAL: BioCLIP checkpoint missing -- copy it from ayush-workspace first"; exit 1; }
+              n_birds=$(find /workspace/Label-free-CBM/data/birds525 -type f | wc -l)
+              n_ann=$(find /workspace/VLG-CBM/annotations -type f | wc -l)
+              echo "found: $n_birds birds525 files, $n_ann annotation files"
+              test "$n_birds" -ge 89885 || { echo "FATAL: birds525 incomplete ($n_birds < 89885)"; exit 1; }
+              test "$n_ann" -ge 88096 || { echo "FATAL: annotations incomplete ($n_ann < 88096)"; exit 1; }
 
               # ---------------------------------------------------------------
               # Preflight 1: BioCLIP 2 is the only genuinely new thing here, and it
@@ -185,9 +192,6 @@ spec:
           volumeMounts:
             - name: ml-storage
               mountPath: /workspace
-            - name: old-storage
-              mountPath: /old
-              readOnly: true
             - name: dshm
               mountPath: /dev/shm
           resources:
@@ -205,10 +209,6 @@ spec:
         - name: ml-storage
           persistentVolumeClaim:
             claimName: vlgcbm-workspace
-        - name: old-storage
-          persistentVolumeClaim:
-            claimName: ayush-workspace
-            readOnly: true
         - name: dshm
           emptyDir:
             medium: Memory
