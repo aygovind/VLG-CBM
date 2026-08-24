@@ -1057,6 +1057,13 @@ def plot_class_accuracy(run, results, worst_k=25, save_path=None):
     return rows
 
 
+def best_worst_classes(run, results, k=5, min_support=1):
+    """(best, worst) class names by accuracy -- what to point the Sankey at."""
+    rows = [r for r in per_class_accuracy(run, results) if r["support"] >= min_support]
+    rows.sort(key=lambda r: r["accuracy"])
+    return [r["class"] for r in rows[-k:][::-1]], [r["class"] for r in rows[:k]]
+
+
 def confused_pairs(run, results, k=20):
     """Most frequent (true -> predicted) mistakes, as a list of dicts."""
     import collections
