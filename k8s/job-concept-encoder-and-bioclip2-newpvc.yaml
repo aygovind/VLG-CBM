@@ -116,14 +116,18 @@ spec:
               git rev-parse HEAD; git status --short || true
 
               echo "===== preflight: bioclip2 ====="
+              # Through model.cbm.Backbone, not get_target_model directly: Backbone's
+              # forward() ignores get_target_model's return value and reads the
+              # visual.ln_post hook instead, so testing the raw model checks the wrong
+              # tensor -- get_target_model("bioclip2")(x) returns the 768-d CLIP-projected
+              # embedding, not the 1024-d pre-projection feature the pipeline actually uses.
               python - <<'PREFLIGHT'
               import torch
-              from data.utils import get_target_model, BACKBONE_ENCODING_DIMENSION
-              m, preprocess = get_target_model("bioclip2", "cuda")
+              from model.cbm import Backbone
+              bb = Backbone("bioclip2", "visual.ln_post", "cuda")
               with torch.no_grad():
-                  f = m(torch.randn(2, 3, 224, 224).cuda())
-              want = BACKBONE_ENCODING_DIMENSION["bioclip2"]
-              assert f.shape == (2, want), (f.shape, want)
+                  f = bb(torch.randn(2, 3, 224, 224).cuda())
+              assert f.shape == (2, bb.output_dim), (f.shape, bb.output_dim)
               print("bioclip2 ok:", tuple(f.shape), "(ViT-L/14, 257 tokens -> 1024-d)")
               PREFLIGHT
 
@@ -223,6 +227,13 @@ spec:
                   # >=16GB. The 11GB 2080-Ti is excluded here, unlike the previous suite:
                   # BioCLIP 2 is ViT-L/14 and LF-CBM extracts at batch 128, which is a
                   # much larger activation footprint than any ViT-B/16 run.
+                  #
+                  # V100 (Volta) is ALSO excluded here, unlike the previous suite: on the
+                  # first run of this job, ViT-L/14's patch-embedding conv (14x14 kernel,
+                  # stride 14 -- an unusual shape none of the other backbones use) hit
+                  # "GET was unable to find an engine to execute this computation" on both
+                  # Tesla-V100-SXM2-16GB and -32GB. Ampere+ (A10 and newer) got past that
+                  # point cleanly. Revisit if a torch/cuDNN upgrade fixes it upstream.
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
@@ -238,6 +249,3 @@ spec:
                       - NVIDIA-L40S
                       - NVIDIA-RTX-5000-Ada-Generation
                       - NVIDIA-RTX-4000-Ada-Generation
-                      - Tesla-V100-SXM2-16GB
-                      - Tesla-V100-SXM2-32GB
-                      - Tesla-V100-PCIE-16GB
