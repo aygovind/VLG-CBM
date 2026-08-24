@@ -1,0 +1,212 @@
+# Six runs spanning both repos, in one job.
+#
+# Part 1 -- is BioCLIP better than CLIP as a *concept encoder*?  (Label-free-CBM, 2 runs)
+#   Two backbones re-run with clip_name=bioclip, each pairing against an existing
+#   ViT-B/16-concept run so only the text tower differs:
+#     clip_vitb16_birds525_bioclip_concepts  <->  clip_vitb16_birds525
+#     in21k_birds525_bioclip_concepts        <->  in21k_birds525
+#   Both are fully cached: the backbone activations come from the existing runs and the
+#   bioclip concept matrix from bioclip_birds525, so neither extracts a single feature.
+#
+# Part 2 -- BioCLIP 2, four models.  (2 in Label-free-CBM, 2 in VLG-CBM)
+#     LF-CBM CBM + black box, VLG-CBM CBM + black box.
+#   BioCLIP 2 is ViT-L/14, NOT ViT-B/16 like every other arm of this comparison. It is
+#   1024-d instead of 768-d and ~3x the forward cost, so it is not capacity-matched --
+#   a win here is confounded with model size. Worth stating in any table it appears in.
+#
+# Both repos live on the same RWO PVC, so they cannot run concurrently anyway; one job
+# means one queue wait instead of two. Do NOT run another lfcbm or vlgcbm job alongside
+# this one -- the LF-CBM activation cache is not concurrency-safe.
+#
+# Ordering is deliberate. The LF-CBM black-box BioCLIP 2 run goes first: it is the
+# cheapest thing that exercises the new backbone end to end, so a broken bioclip2
+# surfaces in under an hour rather than six hours deep -- and it writes the ViT-L/14
+# activation cache that the LF-CBM CBM run then reuses for free.
+#
+# Estimated ~23-25h total; see the per-run table in the accompanying notes.
+#
+# Submit:  kubectl apply -f k8s/job-concept-encoder-and-bioclip2.yaml
+# Watch:   kubectl logs -f job/vlgcbm-concept-encoder-bioclip2
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-concept-encoder-bioclip2
+  labels:
+    app: vlgcbm
+    run: concept-encoder-bioclip2
+spec:
+  backoffLimit: 4                  # evictions are likely; every stage is --skip_existing
+  activeDeadlineSeconds: 259200    # 72h -- ~25h of work, leaving room for a full retry
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: concept-encoder-bioclip2
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: trainer
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - name: HF_HOME
+              value: /workspace/.cache/huggingface
+            - name: TORCH_HOME
+              value: /workspace/.cache/torch
+            - name: PIP_CACHE_DIR
+              value: /workspace/.cache/pip
+            - name: DATASET_FOLDER
+              value: /workspace/VLG-CBM/datasets
+            - name: LFCBM_BIOCLIP_CKPT
+              value: /workspace/models/bioclip/open_clip_pytorch_model.bin
+            - name: VLGCBM_BIOCLIP_CKPT
+              value: /workspace/models/bioclip/open_clip_pytorch_model.bin
+            - name: LAM
+              value: "0.0007"          # matches Label-free-CBM/configs/base.yaml
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/concept-encoder-bioclip2-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              echo "===== environment ====="
+              nvidia-smi
+              source /opt/conda/etc/profile.d/conda.sh
+
+              # ---------------------------------------------------------------
+              # Preflight: BioCLIP 2 is the only genuinely new thing here, and it
+              # is a ~1.7GB HF download. Fail now, not six hours in.
+              # ---------------------------------------------------------------
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              echo "===== code version (VLG-CBM) ====="
+              git rev-parse HEAD; git status --short || true
+
+              echo "===== preflight: bioclip2 ====="
+              python - <<'PREFLIGHT'
+              import torch
+              from data.utils import get_target_model, BACKBONE_ENCODING_DIMENSION
+              m, preprocess = get_target_model("bioclip2", "cuda")
+              with torch.no_grad():
+                  f = m(torch.randn(2, 3, 224, 224).cuda())
+              want = BACKBONE_ENCODING_DIMENSION["bioclip2"]
+              assert f.shape == (2, want), (f.shape, want)
+              print("bioclip2 ok:", tuple(f.shape), "(ViT-L/14, 257 tokens -> 1024-d)")
+              PREFLIGHT
+
+              for split in train val; do
+                n_img=$(find "datasets/birds525/$split" -name '*.jpg' | wc -l)
+                n_ann=$(ls "annotations/birds525_$split" 2>/dev/null | wc -l)
+                echo "birds525_$split: $n_img images, $n_ann annotations"
+                test "$n_img" -eq "$n_ann" || { echo "FATAL: annotation count mismatch"; exit 1; }
+              done
+              echo "PVC free space:"; df -h /workspace | tail -1
+
+              # ===============================================================
+              # PHASE A -- Label-free-CBM
+              # ===============================================================
+              conda activate /workspace/envs/lfcbm
+              cd /workspace/Label-free-CBM
+              echo "===== code version (Label-free-CBM) ====="
+              git rev-parse HEAD; git status --short || true
+              python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
+
+              # A1: black-box BioCLIP 2. Cheapest use of the new backbone, and it writes
+              # saved_activations/birds525_{train,val}_bioclip2_visual.ln_post.pt, which
+              # A2's bioclip2_birds525 CBM run then reuses instead of re-extracting.
+              out="saved_models/std_bioclip2_birds525"
+              if [ -d "$out" ]; then
+                echo "===== A1 std_bioclip2 -- already complete, skipping ====="
+              else
+                echo "===== A1: train_standard bioclip2 (lam=$LAM) ====="
+                start=$(date +%s)
+                python train_standard.py \
+                  --dataset birds525 \
+                  --backbone bioclip2 \
+                  --feature_layer visual.ln_post \
+                  --batch_size 128 \
+                  --lam "$LAM"
+                mv "$(ls -td saved_models/birds525_finetuned_* | head -1)" "$out"
+                echo "A1 finished in $(( ($(date +%s) - start) / 60 )) min -> $out"
+              fi
+
+              # A2: the three CBM runs. run_suite --skip_existing means an evicted job
+              # resumes at run granularity.
+              echo "===== A2: suite concept_encoder_and_bioclip2 ====="
+              python run_suite.py --suite concept_encoder_and_bioclip2 --skip_existing
+
+              # ===============================================================
+              # PHASE B -- VLG-CBM
+              # ===============================================================
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              echo "===== B: suite bioclip2 (black box, then CBM) ====="
+              python run_suite.py --suite bioclip2 --skip_existing --dry_run
+              python run_suite.py --suite bioclip2 --skip_existing
+
+              echo "===== all done ====="
+          volumeMounts:
+            - name: ml-storage
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "8"
+              memory: "24Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "9"
+              memory: "28Gi"
+              ephemeral-storage: "12Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim:
+            claimName: ayush-workspace
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # kubectl logs/exec dial the node's kubelet on :10250 and this host does
+                  # not answer from outside its site, which makes a long job unwatchable.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
+                  # >=16GB. The 11GB 2080-Ti is excluded here, unlike the previous suite:
+                  # BioCLIP 2 is ViT-L/14 and LF-CBM extracts at batch 128, which is a
+                  # much larger activation footprint than any ViT-B/16 run.
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A4000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - Tesla-V100-PCIE-16GB

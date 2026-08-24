@@ -163,6 +163,50 @@ def load_run(load_dir, device=None):
     return Run(load_dir, model, concepts, classes, train_args, backbone.preprocess, device)
 
 
+def run_dir(model, dataset="birds525", save_dir="saved_models"):
+    """Resolve a model name to its newest complete run directory.
+
+        run = va.load_run(va.run_dir("bioclip"))
+
+    `model` is the suffix used by the configs -- bioclip, vit_in21k, dino, clip_vitb16,
+    rn50, bioclip2 -- so saved_models/<dataset>_<model>/<newest timestamped run>.
+    Raises with the available names rather than an opaque path error.
+    """
+    parent = os.path.join(save_dir, "{}_{}".format(dataset, model))
+    if os.path.isdir(parent):
+        if _is_run_dir(parent):
+            return parent
+        nested = sorted(os.path.join(parent, s) for s in os.listdir(parent)
+                        if os.path.isdir(os.path.join(parent, s))
+                        and _is_run_dir(os.path.join(parent, s)))
+        if nested:
+            return nested[-1]
+    raise FileNotFoundError("no complete run for model={!r} dataset={!r} under {}; "
+                            "available: {}".format(model, dataset, save_dir,
+                                                   ", ".join(list_models(dataset, save_dir)) or "none"))
+
+
+def list_models(dataset="birds525", save_dir="saved_models"):
+    """Model names that have a complete run, for the config cell to print."""
+    prefix = "{}_".format(dataset)
+    out = []
+    for d in sorted(os.listdir(save_dir)) if os.path.isdir(save_dir) else []:
+        if not d.startswith(prefix) or d.endswith("_standard"):
+            continue
+        try:
+            run_dir(d[len(prefix):], dataset, save_dir)
+        except FileNotFoundError:
+            continue
+        out.append(d[len(prefix):])
+    return out
+
+
+# ImageFolder rescans the directory tree on construction, which on the PVC is slow
+# enough to notice -- and the plotting helpers each ask for the split again. Keyed by
+# the run so two backbones with different preprocessing do not share an entry.
+_DATA_CACHE = {}
+
+
 def get_data(run, split="val", raw=False):
     """Eval split for this run. raw=True returns undecoded PIL images for display.
 
@@ -170,11 +214,16 @@ def get_data(run, split="val", raw=False):
     split used during training is carved out of `<dataset>_train` and has no name here,
     so split="val" is the set train_cbm.py reports test accuracy on.
     """
-    name = "{}_{}".format(run.dataset, split)
-    if raw:
-        import torchvision.transforms as T
-        return data_utils.get_data(name, preprocess=T.Lambda(lambda x: x))
-    return data_utils.get_data(name, run.preprocess)
+    # raw images are backbone-independent, so every run can share one entry
+    key = (run.dataset, split, raw, None if raw else run.load_dir)
+    if key not in _DATA_CACHE:
+        name = "{}_{}".format(run.dataset, split)
+        if raw:
+            import torchvision.transforms as T
+            _DATA_CACHE[key] = data_utils.get_data(name, preprocess=T.Lambda(lambda x: x))
+        else:
+            _DATA_CACHE[key] = data_utils.get_data(name, run.preprocess)
+    return _DATA_CACHE[key]
 
 
 def annotation_dir_for(run, split="val", annotation_dir=None):
@@ -237,8 +286,22 @@ class Results:
             self.run.name, self.split, self.accuracy, len(self.labels))
 
 
-def evaluate(run, split="val", batch_size=256, num_workers=4):
-    """Run the model over a split, keeping predictions and concept activations."""
+def evaluate(run, split="val", batch_size=256, num_workers=4, cache=True):
+    """Run the model over a split, keeping predictions and concept activations.
+
+    The result is cached next to the run as eval_<split>.pt, because nothing here
+    depends on anything but the weights and the split -- so re-running the cell, or
+    reopening the notebook tomorrow, should not re-run the backbone over the whole set.
+    Pass cache=False to force recomputation.
+    """
+    cache_path = os.path.join(run.load_dir, "eval_{}.pt".format(split))
+    if cache and os.path.exists(cache_path):
+        blob = torch.load(cache_path, map_location="cpu")
+        if blob.get("n_concepts") == len(run.concepts):
+            return Results(run, split, blob["preds"], blob["labels"],
+                           blob["concept_acts"], blob["logits"])
+        print("note: cached {} predates the current model; recomputing".format(cache_path))
+
     data = get_data(run, split)
     loader = DataLoader(data, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=True)
@@ -252,8 +315,13 @@ def evaluate(run, split="val", batch_size=256, num_workers=4):
             acts.append(concept_act.cpu())
             all_logits.append(logits.cpu())
 
-    return Results(run, split, torch.cat(preds), torch.cat(labels),
-                   torch.cat(acts), torch.cat(all_logits))
+    results = Results(run, split, torch.cat(preds), torch.cat(labels),
+                      torch.cat(acts), torch.cat(all_logits))
+    if cache:
+        torch.save({"preds": results.preds, "labels": results.labels,
+                    "concept_acts": results.concept_acts, "logits": results.logits,
+                    "n_concepts": len(run.concepts)}, cache_path)
+    return results
 
 
 def class_indices(results, class_name, only=None, n=None, predicted=False):

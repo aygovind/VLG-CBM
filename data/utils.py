@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple
 
 from matplotlib import pyplot as plt
 import torch
-from pytorchcv.model_provider import get_model as ptcv_get_model
 from torchvision import datasets, models, transforms
 from tqdm import tqdm
 from loguru import logger
@@ -18,6 +17,9 @@ DATASET_FOLDER = os.environ.get("DATASET_FOLDER", "datasets")
 # BioCLIP is not on any hub we can reach from the cluster, so the checkpoint is
 # staged on the PVC and located by env var (same convention as the LF-CBM repo).
 BIOCLIP_CKPT = os.environ.get("VLGCBM_BIOCLIP_CKPT", "/workspace/models/bioclip/open_clip_pytorch_model.bin")
+# BioCLIP 2 is published on the HF hub, so open_clip fetches it by name rather than from
+# a staged file. Note it is ViT-L/14: 1024-d and ~3x the forward cost of BioCLIP 1.
+BIOCLIP2_HUB = os.environ.get("VLGCBM_BIOCLIP2_HUB", "hf-hub:imageomics/bioclip-2")
 
 DATASET_ROOTS = {
     "imagenet_train": f"{DATASET_FOLDER}/imagenet/ILSVRC/Data/CLS-LOC/train",
@@ -65,6 +67,8 @@ BACKBONE_ENCODING_DIMENSION = {
     # capacity is held fixed and only pretraining differs.
     "vit_in21k": 768,
     "dino_vitb16": 768,
+    # ViT-L/14, so wider than everything else here -- and not capacity-matched to it.
+    "bioclip2": 1024,
     # CLIP ViT-B/16 emits the 512-d projected embedding. There is no _penultimate
     # entry because BackboneCLIP's penultimate path rewrites visual.attnpool, which
     # only exists on CLIP's ResNet towers -- use_clip_penultimate must stay false here.
@@ -321,9 +325,23 @@ def load_timm_backbone(target_name, device, pool="cls"):
     return TimmBackbone(model, pool=pool).to(device).eval(), preprocess
 
 
+def load_bioclip2(device):
+    """BioCLIP 2 (ViT-L/14) from the HF hub."""
+    import open_clip
+
+    model, _, preprocess = open_clip.create_model_and_transforms(BIOCLIP2_HUB)
+    return model, preprocess
+
+
 def get_target_model(target_name, device):
     if target_name == "bioclip":
         model, preprocess = load_bioclip(device)
+        target_model = BioCLIPBackbone(model).to(device).eval()
+
+    elif target_name == "bioclip2":
+        # Same wrapper as BioCLIP 1: model.cbm.Backbone hooks visual.ln_post and averages
+        # the token sequence, which is width-agnostic.
+        model, preprocess = load_bioclip2(device)
         target_model = BioCLIPBackbone(model).to(device).eval()
 
     elif target_name in TIMM_BACKBONES:
@@ -346,6 +364,12 @@ def get_target_model(target_name, device):
         preprocess = get_resnet_imagenet_preprocess()
 
     elif target_name == "resnet18_cub":
+        # Imported here rather than at module scope: pytorchcv pulls in the whole of
+        # torchvision.models and torch._dynamo behind it, which measured 1.2s of the
+        # 1.8s it took to import this module warm -- and far more cold, off the PVC.
+        # resnet18_cub is the only thing that needs it.
+        from pytorchcv.model_provider import get_model as ptcv_get_model
+
         target_model = ptcv_get_model("resnet18_cub", pretrained=True).to(device)
         target_model.eval()
         preprocess = get_resnet_imagenet_preprocess()

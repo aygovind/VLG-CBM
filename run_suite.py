@@ -43,6 +43,17 @@ SUITES = {
         ("cbm", "clip_vitb16"),
         ("cbm", "rn50"),
     ],
+    # BioCLIP 2 added to the comparison after the fact. Same two runs per backbone as
+    # above, and --skip_existing means running this suite does not disturb the five that
+    # are already done.
+    #
+    # BioCLIP 2 is ViT-L/14, so unlike every other arm it is not capacity-matched to the
+    # rest -- a win here is confounded with model size. It is also ~3x the forward cost,
+    # which is where the longer runtime comes from.
+    "bioclip2": [
+        ("standard", "bioclip2"),
+        ("cbm", "bioclip2"),
+    ],
 }
 
 # train_standard.py takes flags, so the backbone spec has to be repeated here. Kept in
@@ -53,6 +64,7 @@ STANDARD_BACKBONES = {
     "dino": ("dino_vitb16", "out"),
     "clip_vitb16": ("clip_ViT-B/16", "unused"),
     "rn50": ("resnet50", "layer4"),
+    "bioclip2": ("bioclip2", "visual.ln_post"),
 }
 
 
