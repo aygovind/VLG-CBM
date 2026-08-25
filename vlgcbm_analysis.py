@@ -1346,7 +1346,7 @@ def story_examples(outs, strong=None, domain=None):
 def story_figure(outs, split="val", strong=None, domain=None, top_concepts=0,
                  save_path=None, run_for_images=None, wrap=16,
                  flag_mode="sufficiency", flag_k=None, flag_threshold=0.25,
-                 manual_wrong=None):
+                 manual_wrong=None, flag_fn=None):
     """Single figure: four narrative rows, each one image judged by every model.
 
     Rows are max disagreement, the strong model winning, the domain model winning, and
@@ -1417,9 +1417,12 @@ def story_figure(outs, split="val", strong=None, domain=None, top_concepts=0,
             cell.set_xticks([]); cell.set_yticks([])
             ok = bool(o.correct[idx])
 
-            # manual judgement wins over the automatic proxy wherever it is supplied
+            # precedence: a judgement you made by hand, then a flag_fn (e.g. a VLM
+            # actually looking at the image), then the faithfulness proxy
             if (o.name, idx) in manual:
                 suspect = True
+            elif flag_fn is not None:
+                suspect = bool(flag_fn(o, idx, ok))
             elif ok:
                 suspect = flag_explanation(o, idx, k=k_flag, mode=flag_mode,
                                            threshold=flag_threshold)
@@ -1460,7 +1463,8 @@ def story_figure(outs, split="val", strong=None, domain=None, top_concepts=0,
 
     title = "Qualitative comparison on {} -- one image per failure mode".format(split)
     if flagged_any:
-        how = "manual" if flag_mode in (None, "none") else flag_mode
+        how = ("VLM judge" if flag_fn is not None
+               else "manual" if flag_mode in (None, "none") else flag_mode)
         title += ("\nOK* = correct prediction, displayed concepts do not account for it"
                   " ({}, k={})".format(how, k_flag))
     fig.suptitle(title, fontsize=12, y=0.995)
@@ -1658,3 +1662,139 @@ def plot_concept_agreement(run, rows=None, results=None, split="val", k=20,
     fig.tight_layout()
     _save_fig(fig, save_path)
     return fig
+
+
+# ---------------------------------------------------------------------------
+# VLM judge. story_figure's amber cells are set by a proxy (explanation_sufficient)
+# that can only detect an *unfaithful* explanation -- one whose displayed concepts do
+# not account for the logit -- never a *wrong* one, because no per-image trait labels
+# exist. A VLM that looks at the image and answers "is this concept visible?" tests the
+# thing the proxy cannot: whether the concept the model leveraged is actually there.
+# ---------------------------------------------------------------------------
+
+
+class VLMJudge:
+    """Asks a small VLM whether a concept is visible in an image.
+
+    Scores by comparing the logits of " Yes" and " No" for the first generated token
+    rather than parsing generated text, so the answer is deterministic, needs one forward
+    pass, and yields a probability that can be thresholded instead of a bare boolean.
+
+    Defaults to Qwen2-VL-2B in float16: ~4.4GB, and T4 is Turing, which has no bfloat16.
+    """
+
+    def __init__(self, model_id="Qwen/Qwen2-VL-2B-Instruct", device="cuda", dtype=None):
+        import torch
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+
+        if dtype is None:
+            # bf16 needs Ampere+; T4 and older silently fall back and run slowly
+            dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        self.device, self.model_id = device, model_id
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = AutoModelForVision2Seq.from_pretrained(
+            model_id, torch_dtype=dtype).to(device).eval()
+
+        tok = self.processor.tokenizer
+        # the leading space matters: chat templates put the answer after one
+        self._yes = [i for s in (" Yes", "Yes") for i in tok.encode(s, add_special_tokens=False)[:1]]
+        self._no = [i for s in (" No", "No") for i in tok.encode(s, add_special_tokens=False)[:1]]
+
+    def score(self, image, concept):
+        """P(yes) that `concept` is visible, in [0, 1]."""
+        import torch
+
+        prompt = (f'Look at this bird photograph. Is "{concept}" clearly visible in the '
+                  f"image? Answer only Yes or No.")
+        messages = [{"role": "user",
+                     "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+        text = self.processor.apply_chat_template(messages, tokenize=False,
+                                                  add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=[image.convert("RGB")],
+                                return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            logits = self.model(**inputs).logits[0, -1].float()
+        yes = torch.logsumexp(logits[self._yes], 0)
+        no = torch.logsumexp(logits[self._no], 0)
+        return float(torch.softmax(torch.stack([no, yes]), 0)[1])
+
+    def present(self, image, concept, threshold=0.5):
+        return self.score(image, concept) >= threshold
+
+    def sanity_check(self, run, results, split="val", n=6, seed=0, verbose=True):
+        """Verify the judge discriminates before any of its answers are trusted.
+
+        A judge that answers Yes to everything would silently mark every cell green and
+        look like a clean result. So this compares two populations: concepts Grounding
+        DINO actually detected in an image, and concepts drawn from a different image's
+        detections. It returns the gap, and the caller should refuse to use a judge whose
+        gap is not clearly positive.
+        """
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        raw = get_data(run, split, raw=True)
+        idxs = rng.choice(len(results.labels), size=n, replace=False)
+
+        present_scores, absent_scores = [], []
+        for i in idxs:
+            try:
+                here = {a["label"] for a in annotations_for(run, int(i), split)}
+            except FileNotFoundError:
+                continue
+            j = int(rng.choice([k for k in idxs if k != i]))
+            try:
+                other = {a["label"] for a in annotations_for(run, j, split)} - here
+            except FileNotFoundError:
+                continue
+            if not here or not other:
+                continue
+            img = raw[int(i)][0]
+            present_scores.append(self.score(img, sorted(here)[rng.integers(len(here))]))
+            absent_scores.append(self.score(img, sorted(other)[rng.integers(len(other))]))
+
+        if not present_scores:
+            raise RuntimeError("sanity check collected no pairs -- are annotations present?")
+        p, a = float(np.mean(present_scores)), float(np.mean(absent_scores))
+        if verbose:
+            print(f"{self.model_id}")
+            print(f"  mean P(yes) on DETECTED concepts : {p:.3f}  (n={len(present_scores)})")
+            print(f"  mean P(yes) on OTHER-IMAGE concepts: {a:.3f}")
+            print(f"  separation: {p - a:+.3f}")
+            if p - a < 0.05:
+                print("  WARNING: judge barely discriminates -- its flags would be noise. "
+                      "Try a different model or rephrase the prompt before using it.")
+            else:
+                print("  OK: judge separates present from absent.")
+        return {"present": p, "absent": a, "separation": p - a, "n": len(present_scores)}
+
+
+def vlm_flag_fn(judge, run, split="val", k=2, threshold=0.5, cache=None, verbose=False):
+    """Build a flag_fn for story_figure that asks the VLM instead of using the proxy.
+
+    Flags a cell when a concept the model leveraged is not actually visible. A concept
+    shown as "NOT x" means the model used the *absence* of x, so that one is flagged when
+    x turns out to be present -- the contradiction is the mirror image.
+    """
+    raw = get_data(run, split, raw=True)
+    cache = {} if cache is None else cache
+
+    def flag(out, idx, ok):
+        if not ok:
+            return False
+        concepts = out.top_concepts(idx, k=k)
+        img = raw[int(idx)][0]
+        for c in concepts:
+            negated = c.startswith("NOT ")
+            name = c[4:] if negated else c
+            key = (int(idx), name)
+            if key not in cache:
+                cache[key] = judge.score(img, name)
+            visible = cache[key] >= threshold
+            if visible == negated:          # claimed present but absent, or vice versa
+                if verbose:
+                    print(f"  flag {out.name} idx={idx}: {c!r} score={cache[key]:.2f}")
+                return True
+        return False
+
+    return flag
