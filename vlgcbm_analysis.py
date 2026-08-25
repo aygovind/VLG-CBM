@@ -1699,15 +1699,30 @@ class VLMJudge:
 
     def __init__(self, model_id="Qwen/Qwen2-VL-2B-Instruct", device="cuda", dtype=None):
         import torch
-        from transformers import AutoModelForVision2Seq, AutoProcessor
+        import transformers
+        from transformers import AutoProcessor
+
+        # The vision-language auto-class has been renamed across transformers versions:
+        # AutoModelForVision2Seq in ~4.4x, AutoModelForImageTextToText later. Plain
+        # AutoModel is deliberately NOT a fallback -- it loads the base model without an
+        # LM head, so there would be no vocabulary logits and score()'s Yes/No comparison
+        # would fail obscurely rather than cleanly.
+        auto_cls = next((getattr(transformers, n) for n in
+                         ("AutoModelForImageTextToText", "AutoModelForVision2Seq",
+                          "Qwen2VLForConditionalGeneration")
+                         if hasattr(transformers, n)), None)
+        if auto_cls is None:
+            raise ImportError(
+                "no vision-language auto-class in transformers {}; available: {}".format(
+                    transformers.__version__,
+                    [n for n in dir(transformers) if n.startswith("AutoModel")]))
 
         if dtype is None:
             # bf16 needs Ampere+; T4 and older silently fall back and run slowly
             dtype = torch.float16 if device.startswith("cuda") else torch.float32
         self.device, self.model_id = device, model_id
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_id, torch_dtype=dtype).to(device).eval()
+        self.model = auto_cls.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
 
         tok = self.processor.tokenizer
         # the leading space matters: chat templates put the answer after one
