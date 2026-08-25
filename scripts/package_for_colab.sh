@@ -1,8 +1,8 @@
 #!/bin/bash
 # Tar up exactly what the Colab notebook needs and nothing else: val-split images,
-# val-split annotations, the requested trained runs, and (only if bioclip v1 is among
-# them) its checkpoint. Everything else the notebook needs -- concept_files, the repo
-# code -- comes from `git clone` and does not need to travel.
+# val-split annotations, and the trained run artifacts. Backbone weights do NOT travel --
+# every backbone resolves from a public source at load time. Everything else the notebook
+# needs -- concept_files, the repo code -- comes from `git clone`.
 #
 # Run on the pod, from the VLG-CBM repo root:
 #   bash scripts/package_for_colab.sh bioclip vit_in21k > /tmp/models.txt   # which models
@@ -19,7 +19,7 @@ fi
 
 OUT=colab_package
 rm -rf "$OUT"
-mkdir -p "$OUT/data/birds525" "$OUT/annotations" "$OUT/saved_models" "$OUT/models/bioclip"
+mkdir -p "$OUT/data/birds525" "$OUT/annotations" "$OUT/saved_models"
 
 echo "birds525 val images..."
 cp -r datasets/birds525/val "$OUT/data/birds525/val"
@@ -37,7 +37,6 @@ cp -r annotations/birds525_val "$OUT/annotations/birds525_val"
 KEEP_FILES=(cbl.pt final.pt concepts.txt concept_counts.txt args.txt
             train_concept_features_mean.pt train_concept_features_std.pt eval_val.pt)
 
-need_bioclip1=false
 for m in "${MODELS[@]}"; do
   src="saved_models/birds525_${m}"
   test -d "$src" || { echo "FATAL: no saved_models/birds525_${m}"; exit 1; }
@@ -49,17 +48,12 @@ for m in "${MODELS[@]}"; do
   for f in "${KEEP_FILES[@]}"; do
     [ -f "$run/$f" ] && cp "$run/$f" "$dst/$f"
   done
-  [ "$m" == "bioclip" ] && need_bioclip1=true
 done
 
-if [ "$need_bioclip1" = true ]; then
-  echo "bioclip v1 checkpoint (bioclip2 and the others pull from public hubs, no staging needed)..."
-  # Shared across both repos at /workspace/models, one level above the repo root this
-  # script runs from -- not VLG-CBM/models, which does not exist.
-  CKPT="${VLGCBM_BIOCLIP_CKPT:-/workspace/models/bioclip/open_clip_pytorch_model.bin}"
-  test -f "$CKPT" || { echo "FATAL: bioclip checkpoint not found at $CKPT"; exit 1; }
-  cp "$CKPT" "$OUT/models/bioclip/"
-fi
+# No backbone weights travel in this package. Every backbone resolves from a public
+# source at load time -- bioclip and bioclip2 from the HF hub, vit_in21k/dino via timm,
+# clip_vitb16 via open_clip, rn50 via torchvision. Shipping BioCLIP v1's checkpoint here
+# added 570MB, ~85% of the tarball, for weights the target machine can fetch itself.
 
 tar czf colab_package.tar.gz "$OUT"
 rm -rf "$OUT"

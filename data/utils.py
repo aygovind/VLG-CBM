@@ -14,9 +14,13 @@ from PIL import Image
 # get from the environment variable
 DATASET_FOLDER = os.environ.get("DATASET_FOLDER", "datasets")
 
-# BioCLIP is not on any hub we can reach from the cluster, so the checkpoint is
-# staged on the PVC and located by env var (same convention as the LF-CBM repo).
+# BioCLIP v1 is staged on the PVC (same convention as the LF-CBM repo) and located by
+# env var. It is also public on the HF hub under an MIT license, and the staged file is
+# byte-identical to the hub's (both 598,599,013 bytes), so load_bioclip falls back to the
+# hub when the staged file is absent -- which is what makes this repo runnable off the
+# PVC, e.g. on Colab, without moving 570MB around.
 BIOCLIP_CKPT = os.environ.get("VLGCBM_BIOCLIP_CKPT", "/workspace/models/bioclip/open_clip_pytorch_model.bin")
+BIOCLIP_HUB = os.environ.get("VLGCBM_BIOCLIP_HUB", "hf-hub:imageomics/bioclip")
 # BioCLIP 2 is published on the HF hub, so open_clip fetches it by name rather than from
 # a staged file. Note it is ViT-L/14: 1024-d and ~3x the forward cost of BioCLIP 1.
 BIOCLIP2_HUB = os.environ.get("VLGCBM_BIOCLIP2_HUB", "hf-hub:imageomics/bioclip-2")
@@ -265,8 +269,17 @@ class BioCLIPBackbone(torch.nn.Module):
 
 
 def load_bioclip(device):
-    """Load the BioCLIP ViT-B/16 checkpoint into an open_clip model."""
+    """Load the BioCLIP ViT-B/16 checkpoint into an open_clip model.
+
+    Prefers the staged checkpoint and falls back to the hub, rather than the reverse, so
+    a machine that has the file keeps using it and never depends on the network mid-run.
+    The two are the same weights, so results do not depend on which path is taken.
+    """
     import open_clip
+
+    if not os.path.exists(BIOCLIP_CKPT):
+        model, _, preprocess = open_clip.create_model_and_transforms(BIOCLIP_HUB)
+        return model, preprocess
 
     model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-16")
     checkpoint = torch.load(BIOCLIP_CKPT, map_location="cpu", weights_only=False)
