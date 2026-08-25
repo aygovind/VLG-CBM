@@ -54,7 +54,11 @@ done
 
 if [ "$need_bioclip1" = true ]; then
   echo "bioclip v1 checkpoint (bioclip2 and the others pull from public hubs, no staging needed)..."
-  cp models/bioclip/open_clip_pytorch_model.bin "$OUT/models/bioclip/"
+  # Shared across both repos at /workspace/models, one level above the repo root this
+  # script runs from -- not VLG-CBM/models, which does not exist.
+  CKPT="${VLGCBM_BIOCLIP_CKPT:-/workspace/models/bioclip/open_clip_pytorch_model.bin}"
+  test -f "$CKPT" || { echo "FATAL: bioclip checkpoint not found at $CKPT"; exit 1; }
+  cp "$CKPT" "$OUT/models/bioclip/"
 fi
 
 tar czf colab_package.tar.gz "$OUT"
