@@ -173,6 +173,11 @@ spec:
               # A1: black-box BioCLIP 2. Cheapest use of the new backbone, and it writes
               # saved_activations/birds525_{train,val}_bioclip2_visual.ln_post.pt, which
               # A2's bioclip2_birds525 CBM run then reuses instead of re-extracting.
+              # Both repos' train_standard.py used os.mkdir on a path whose parent may
+              # not exist, and it runs *after* the full solve -- so the failure discarded
+              # ~2.5h of finished work the first time. Both are patched to makedirs now;
+              # this line makes the job independent of that fix holding.
+              mkdir -p saved_models saved_activations
               out="saved_models/std_bioclip2_birds525"
               if [ -d "$out" ]; then
                 echo "===== A1 std_bioclip2 -- already complete, skipping ====="
