@@ -214,15 +214,21 @@ spec:
               mountPath: /workspace
             - name: dshm
               mountPath: /dev/shm
+          # Sized down from 8 CPU / 24Gi, which left this pending 8h. A probe pod with
+          # the identical GPU affinity but 1 CPU / 2Gi scheduled in seconds, so the GPU
+          # list was never the constraint -- the CPU and memory request was. 4 CPU still
+          # feeds save_target_activations' 8 dataloader workers (they are I/O bound on
+          # 224x224 JPEGs, not compute bound); the concept features live on the GPU, so
+          # host memory is only dataloader buffers.
           resources:
             requests:
-              cpu: "8"
-              memory: "24Gi"
+              cpu: "4"
+              memory: "12Gi"
               ephemeral-storage: "10Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "9"
-              memory: "28Gi"
+              cpu: "6"
+              memory: "16Gi"
               ephemeral-storage: "12Gi"
               nvidia.com/gpu: "1"
       volumes:
