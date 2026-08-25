@@ -1542,9 +1542,14 @@ def explain_with_boxes(run, idx, split="val", top_k=8, annotation_dir=None, figs
     axes[0].set_title(title, fontsize=9,
                       color="black" if pred == int(label) else "firebrick")
 
-    order = np.argsort(contrib)
-    y = np.arange(len(order))
-    bar_colors = ["tab:blue" if contrib[i] >= 0 else "tab:red" for i in order]
+    # Same order and colours as explain_example: _top_contributions already ranks by
+    # |contribution|, and re-sorting by signed value here made the two plots disagree on
+    # the tail (a -0.46 outranks a +0.44 by magnitude but not by value) while red/blue
+    # also meant the opposite thing in each. Same numbers, so the only thing that
+    # differed was which plot you happened to be reading.
+    order = np.arange(len(contrib))
+    y = np.arange(len(order))[::-1]
+    bar_colors = ["tab:red" if contrib[i] > 0 else "tab:blue" for i in order]
     axes[1].barh(y, contrib[order], color=bar_colors)
     axes[1].set_yticks(y)
     axes[1].set_yticklabels(
