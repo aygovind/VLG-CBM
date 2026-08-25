@@ -110,6 +110,21 @@ spec:
               test "$n_birds" -ge 89885 || { echo "FATAL: birds525 incomplete ($n_birds < 89885)"; exit 1; }
               test "$n_ann" -ge 88096 || { echo "FATAL: annotations incomplete ($n_ann < 88096)"; exit 1; }
 
+              # Counting files is not enough: the PVC-to-PVC copy used `cp -n`, which skips
+              # anything already present, so a file left half-written by an evicted copy pod
+              # was silently kept at whatever length it had reached. One image and one
+              # annotation arrived 0 bytes that way, passed the count check, and crashed
+              # A1 twenty minutes in with PIL.UnidentifiedImageError. Empty files are the
+              # signature of that failure, and the scan is seconds against hours lost.
+              n_empty=$(find /workspace/Label-free-CBM/data/birds525 /workspace/VLG-CBM/annotations \
+                          -type f -size 0 | tee /tmp/empty_files.txt | wc -l)
+              if [ "$n_empty" -ne 0 ]; then
+                echo "FATAL: $n_empty zero-byte file(s) -- the copy is damaged, not merely present:"
+                head -20 /tmp/empty_files.txt
+                exit 1
+              fi
+              echo "integrity: no zero-byte files"
+
               # ---------------------------------------------------------------
               # Preflight 1: BioCLIP 2 is the only genuinely new thing here, and it
               # is a ~1.7GB HF download. Fail now, not six hours in.
