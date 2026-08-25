@@ -1722,7 +1722,12 @@ class VLMJudge:
             dtype = torch.float16 if device.startswith("cuda") else torch.float32
         self.device, self.model_id = device, model_id
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = auto_cls.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
+        # transformers renamed this kwarg dtype -> torch_dtype -> dtype across versions
+        # too; torch_dtype still works but now warns on every load.
+        try:
+            self.model = auto_cls.from_pretrained(model_id, dtype=dtype).to(device).eval()
+        except TypeError:
+            self.model = auto_cls.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
 
         tok = self.processor.tokenizer
         # the leading space matters: chat templates put the answer after one
