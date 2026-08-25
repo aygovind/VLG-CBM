@@ -364,31 +364,45 @@ def summarize(run, results=None, split="val"):
     results = results or evaluate(run, split)
     W_g = run.model.final.weight.detach().cpu()
     nnz = (W_g.abs() > 1e-5).sum().item()
+    # VLG-CBM's args.txt has no clip_name (there is no concept encoder -- concepts come
+    # from the Grounding DINO annotations) and calls the sparsity knob saga_lam, so the
+    # LF-CBM field names this was ported with are absent. .get keeps a run with an older
+    # or partial args.txt in the table instead of dropping it.
+    a = run.train_args
     return {
         "run": run.name,
         "backbone": run.backbone,
-        "clip_name": run.train_args["clip_name"],
-        "lam": run.train_args["lam"],
         "accuracy": round(results.accuracy, 4),
         "n_concepts": len(run.concepts),
-        "frac_non_zero": round(nnz / W_g.numel(), 4),
         "concepts_per_class": round(nnz / W_g.shape[0], 1),
+        "frac_non_zero": round(nnz / W_g.numel(), 4),
+        "saga_lam": a.get("saga_lam"),
+        "cbl_epochs": a.get("cbl_epochs"),
     }
 
 
 def compare(load_dirs, split="val", device=None):
     """Summary table across several runs. Returns a DataFrame if pandas is available."""
-    rows = []
+    rows, failures = [], []
     for d in load_dirs:
         try:
             rows.append(summarize(load_run(d, device), split=split))
         except Exception as exc:
-            print("skipping {}: {}".format(d, exc))
+            print("skipping {}: {!r}".format(d, exc))
+            failures.append((d, exc))
+
+    # Without this, every run failing leaves rows empty and pandas raises
+    # KeyError: 'accuracy' on the sort -- which says nothing about the actual cause.
+    if not rows:
+        raise RuntimeError(
+            "every run failed to summarise; first error was on {}: {!r}".format(*failures[0])
+            if failures else "no run directories given")
+
     try:
         import pandas as pd
         return pd.DataFrame(rows).sort_values("accuracy", ascending=False)
     except ImportError:
-        return rows
+        return sorted(rows, key=lambda r: -r["accuracy"])
 
 
 def _is_run_dir(path):
