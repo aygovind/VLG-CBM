@@ -1064,6 +1064,33 @@ def best_worst_classes(run, results, k=5, min_support=1):
     return [r["class"] for r in rows[-k:][::-1]], [r["class"] for r in rows[:k]]
 
 
+def class_table(run, results, sort="accuracy", n=25, ascending=True):
+    """Per-class accuracy with support, for choosing a class to inspect.
+
+    Prints correct/support alongside accuracy because the accuracy alone is coarse:
+    birds525's val split has 5 images per class, so it takes only 6 distinct values and
+    "best" and "worst" are large tie groups rather than a ranking. Sort by "name" to
+    scan alphabetically instead.
+    """
+    rows = per_class_accuracy(run, results)
+    supports = {r["support"] for r in rows}
+    if sort == "name":
+        rows.sort(key=lambda r: r["class"])
+    else:
+        rows.sort(key=lambda r: (r["accuracy"], r["class"]), reverse=not ascending)
+
+    shown = rows if n is None else rows[:n]
+    print(f"{'class':38s} {'correct':>9s} {'accuracy':>9s}")
+    for r in shown:
+        print(f"  {r['class']:36s} {r['correct']:3d}/{r['support']:<3d} {r['accuracy'] * 100:8.1f}%")
+    if len(supports) == 1:
+        k = supports.pop()
+        ties = sum(1 for r in rows if r["accuracy"] == shown[0]["accuracy"]) if shown else 0
+        print(f"\n{len(rows)} classes, {k} images each -> accuracy takes only {k + 1} values; "
+              f"{ties} classes tie at {shown[0]['accuracy'] * 100:.0f}%" if shown else "")
+    return rows
+
+
 def confused_pairs(run, results, k=20):
     """Most frequent (true -> predicted) mistakes, as a list of dicts."""
     import collections
