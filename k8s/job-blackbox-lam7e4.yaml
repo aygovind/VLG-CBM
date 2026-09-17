@@ -192,6 +192,11 @@ spec:
                     operator: NotIn
                     values:
                       - v100-cc-star-01.noc.ucsb.edu
+                      # advertises GPUs it cannot allocate -- the device plugin fails with
+                      # "GPU is lost" (NVLink query on a card that fell off the bus). It
+                      # rejected two pods here, and each rejection burns a backoffLimit
+                      # slot, so a bad node can exhaust the retries without ever running.
+                      - nautilus-ext-gpu01.fullerton.edu
                   # >=16GB, Ampere or newer. V100 (Volta) is excluded because bioclip2 is
                   # ViT-L/14 and its 14x14 patch conv finds no cuDNN kernel there.
                   - key: nvidia.com/gpu.product
