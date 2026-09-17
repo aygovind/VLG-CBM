@@ -1,0 +1,211 @@
+# Re-run all six VLG-CBM black-box (linear probe) baselines at LF-CBM's hyperparameters,
+# so the two repos' black boxes become directly comparable.
+#
+# Why: the existing VLG-CBM black boxes used saga_lam=0.0002 / saga_n_iters=4000, copied
+# from the paper's cub.json. LF-CBM used lam=0.0007 / n_iters=1000, which is also the
+# argparse default in BOTH repos and in three of VLG-CBM's five released configs. Nothing
+# else differs -- identical feature pooling, identical splits, identical solver
+# (train_sparse_final just wraps the same glm_saga call LF-CBM makes inline), same
+# zero-init, same step_size 0.1 / ALPHA 0.99, same hardcoded SAGA batch of 512. So lam
+# and n_iters are the only two knobs that need to move.
+#
+# Unlike the CBMs, ANEC cannot rescue these: sparse_evaluation operates on concept
+# features, and a black box's weights are over raw backbone dimensions. Matching lam is
+# the only route to comparable black-box numbers.
+#
+# Writes to saved_models/<name>_standard_lam7e4 so the lam=0.0002 results are preserved
+# -- bioclip2_standard's 98.55% / 20,831 nonzero doubles as a reproducibility reference.
+#
+# Conventions carried over from k8s/job-concept-encoder-and-bioclip2-newpvc.yaml, each
+# of which was learned the hard way:
+#   - 4 CPU / 12Gi. 8 CPU / 24Gi sat Pending 8h while a probe pod with the same GPU
+#     affinity and 1 CPU scheduled in seconds -- the resource request was the constraint,
+#     not the GPU pool.
+#   - V100 excluded. ViT-L/14's 14x14 patch conv has no cuDNN kernel on Volta, which
+#     killed five attempts before bioclip2 was pinned to Ampere+.
+#   - Preflight checks for zero-byte files, not just file counts: a `cp -n` copy left an
+#     image at 0 bytes, passed a count check, and crashed a run 20 minutes in.
+#   - mkdir -p before any run: both repos' train_standard.py used os.mkdir on a path
+#     whose parent may not exist, and it fires *after* the solve, discarding hours.
+#   - Log mirrored to the PVC: kubectl logs dials the node kubelet, and some NRP nodes
+#     do not answer from outside their site.
+#   - Only vlgcbm-workspace is mounted. It is RWO, so holding ayush-workspace here would
+#     block the user's jupyter pod for the job's whole runtime.
+#
+# Do NOT run another job against this PVC concurrently -- the activation cache is not
+# concurrency-safe.
+#
+# Submit:  kubectl apply -f k8s/job-blackbox-lam7e4.yaml
+# Watch:   kubectl logs -f job/vlgcbm-blackbox-lam7e4
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-blackbox-lam7e4
+  labels:
+    app: vlgcbm
+    run: blackbox-lam7e4
+spec:
+  backoffLimit: 4                  # evictions are likely; finished runs are skipped on retry
+  activeDeadlineSeconds: 172800    # 48h -- ~8-10h of work, room for a full retry
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: blackbox-lam7e4
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: trainer
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - name: HF_HOME
+              value: /workspace/.cache/huggingface
+            - name: TORCH_HOME
+              value: /workspace/.cache/torch
+            - name: PIP_CACHE_DIR
+              value: /workspace/.cache/pip
+            - name: DATASET_FOLDER
+              value: /workspace/VLG-CBM/datasets
+            - name: VLGCBM_BIOCLIP_CKPT
+              value: /workspace/models/bioclip/open_clip_pytorch_model.bin
+            - name: LAM
+              value: "0.0007"      # LF-CBM base.yaml, and the argparse default in both repos
+            - name: N_ITERS
+              value: "1000"        # LF-CBM default; glm_saga early-stops on its criterion anyway
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/blackbox-lam7e4-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              echo "===== environment ====="
+              nvidia-smi
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              python -c "import torch; print('torch', torch.__version__, '| cuda:', torch.cuda.is_available())"
+
+              echo "===== code version ====="
+              git rev-parse HEAD; git status --short || true
+
+              echo "===== preflight ====="
+              n_img=$(find -L datasets/birds525 -name '*.jpg' | wc -l)
+              echo "birds525 images: $n_img"
+              test "$n_img" -ge 89885 || { echo "FATAL: birds525 incomplete ($n_img < 89885)"; exit 1; }
+
+              # a zero-byte file counts in a `find | wc -l`, so count is not integrity
+              n_empty=$(find -L datasets/birds525 -type f -size 0 | tee /tmp/empty.txt | wc -l)
+              if [ "$n_empty" -ne 0 ]; then
+                echo "FATAL: $n_empty zero-byte image(s):"; head -10 /tmp/empty.txt; exit 1
+              fi
+              echo "integrity: no zero-byte files"
+              echo "PVC free space:"; df -h /workspace | tail -1
+
+              # train_standard.py writes into --save_dir with os.mkdir, which only creates
+              # the leaf, and does so after the solve
+              mkdir -p saved_models saved_activations
+
+              # bioclip first: its activations are already cached, so a broken backbone or
+              # a bad solver config surfaces in minutes rather than after an extraction.
+              for spec in "bioclip2:visual.ln_post" \
+                          "bioclip:visual.ln_post" \
+                          "vit_in21k:out" \
+                          "dino_vitb16:out" \
+                          "clip_ViT-B/16:unused" \
+                          "resnet50:layer4"; do
+
+                IFS=":" read -r backbone layer <<< "$spec"
+                tag=$(echo "$backbone" | tr -d '/' | tr '[:upper:]' '[:lower:]')
+                out="saved_models/${tag}_standard_lam7e4"
+
+                if [ -d "$out" ]; then
+                  echo "===== $tag -- already complete, skipping ====="
+                  continue
+                fi
+
+                echo "===== $tag (lam=$LAM, n_iters=$N_ITERS) ====="
+                start=$(date +%s)
+                python train_standard.py \
+                  --dataset birds525 \
+                  --backbone "$backbone" \
+                  --feature_layer "$layer" \
+                  --device cuda \
+                  --lam "$LAM" \
+                  --n_iters "$N_ITERS"
+
+                # train_standard names its output by timestamp; move it to a stable name
+                mv "$(ls -td saved_models/birds525_finetuned_* | head -1)" "$out"
+                echo "$tag finished in $(( ($(date +%s) - start) / 60 )) min -> $out"
+                python -c "
+              import json
+              m = json.load(open('$out/metrics.txt'))
+              s, mt = m['sparsity'], m['metrics']
+              print('  accuracy:', mt.get('acc_val'), '| nonzero:', s['Non-zero weights'],
+                    '/', s['Total weights'])
+              " || true
+              done
+
+              echo "===== all done ====="
+              ls -d saved_models/*_standard_lam7e4
+          volumeMounts:
+            - name: ml-storage
+              mountPath: /workspace
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "6"
+              memory: "16Gi"
+              ephemeral-storage: "12Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim:
+            claimName: vlgcbm-workspace
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # this host's kubelet does not answer on :10250 from outside its site,
+                  # which makes a long job unwatchable
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
+                  # >=16GB, Ampere or newer. V100 (Volta) is excluded because bioclip2 is
+                  # ViT-L/14 and its 14x14 patch conv finds no cuDNN kernel there.
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A4000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation
