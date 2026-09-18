@@ -1,0 +1,55 @@
+# Shared RWX volume for read-mostly data: datasets, pretrained weights, finished
+# checkpoints, analysis dumps.
+#
+# Why: ayush-workspace and vlgcbm-workspace are both RWO (rook-ceph-block), which binds
+# a volume to one node at a time. That is what made the jupyter pod and the training job
+# mutually exclusive -- 4h16m of a job sat Pending purely because a pod held the same
+# claim. CephFS is ReadWriteMany, so any number of pods mount it at once and that class
+# of stall disappears.
+#
+# rook-cephfs is the US West class, matching where rook-ceph-block already places these
+# volumes and where most of the GPU nodes in use here live. NRP asks that pods use node
+# affinity matching the storage region; the existing job yamls' GPU allowlists already
+# skew west, so no change is needed there.
+#
+# NOT rook-cephfs-ucsd: that class is NVMe under a "use for the running computation then
+# promptly delete" policy, with admins reserving the right to purge. Wrong fit for
+# datasets that need to persist across months of experiments.
+#
+# 200Gi: the two existing PVCs hold ~93G today (ayush-workspace is 84G/100G at 84%, which
+# is itself becoming a problem, and vlgcbm-workspace is 31G/40G at 79%). birds525 exists
+# on both, so consolidating reclaims that duplication. CephFS supports online expansion,
+# so this is a starting point rather than a ceiling -- `kubectl patch` the storage field
+# to grow it without downtime.
+#
+# Rules this volume must respect (docs.nationalresearchplatform.org, storage/ceph):
+#   - NO conda or pip installs here. Installing packages on any CephFS filesystem is
+#     strictly prohibited by NRP. Environments stay on block storage (ayush-workspace)
+#     or get rebuilt into the pod's ephemeral storage at startup.
+#   - CephFS is built for large files and parallel I/O, and explicitly "cannot handle
+#     lots of small files rapidly". Datasets of many small JPEGs will be slower here than
+#     on RBD; if birds525 loading becomes the bottleneck, pack it into tar shards or
+#     leave it on block storage.
+#   - RWX removes the mount lock, not the write lock. Concurrent writes to the SAME file
+#     from multiple pods risk corruption. Give each job its own output subdirectory --
+#     VLG-CBM's activation cache in particular is not concurrency-safe.
+#   - Volumes unused for 6 months may be purged without notification. This is not
+#     archival storage.
+#
+# Create:  kubectl apply -f k8s/pvc-shared-rwx.yaml
+# Verify:  kubectl apply -f k8s/job-test-rwx.yaml
+# Grow:    kubectl patch pvc ayush-shared -p '{"spec":{"resources":{"requests":{"storage":"400Gi"}}}}'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ayush-shared
+  labels:
+    app: vlgcbm
+    purpose: shared-data
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: rook-cephfs
+  resources:
+    requests:
+      storage: 200Gi

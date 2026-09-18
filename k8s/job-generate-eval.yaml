@@ -1,0 +1,190 @@
+# Generate eval_val.pt for every VLG-CBM CBM, plus a self-contained downloadable bundle.
+#
+# See scripts/generate_eval.py for what is stored. In short: predictions, labels,
+# logits and normalized concept activations for all 2,625 held-out test images, via
+# vlgcbm_analysis.evaluate() -- the same code path the notebooks use -- so the numbers
+# are identical to what a notebook would compute.
+#
+# Inference only: no training, no solver. ~1-2 min per model.
+#
+# Code delivery: both scripts ship in a ConfigMap rather than via git, so running this
+# needs no push and does not depend on how current the PVC's checkout is. The ConfigMap
+# copy of vlgcbm_analysis.py is put first on PYTHONPATH, pinning the analysis code to
+# the version this was written against; data/ and model/ still come from the checkout.
+#
+#   kubectl create configmap vlgcbm-generate-eval \
+#     --from-file=scripts/generate_eval.py --from-file=vlgcbm_analysis.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f k8s/job-generate-eval.yaml
+#   kubectl logs -f job/vlgcbm-generate-eval
+#
+# Volumes:
+#   vlgcbm-workspace (RWO) -- models, dataset, conda env. Held for the job's duration,
+#       so nothing else can mount it meanwhile; that is fine for a ~15-minute job.
+#   ayush-shared (RWX)     -- bundles land in /shared/vlgcbm_eval, readable from any
+#       other pod while this runs. This is the pattern: jobs read from their own RWO
+#       scratch and write outputs to the shared volume.
+#
+# Conventions carried from earlier jobs:
+#   - limits == requests. NRP now rejects a limit/request ratio above 1.2
+#     (container-must-meet-memory-and-cpu-ratio); the older job yamls predate this.
+#   - fsGroupChangePolicy: OnRootMismatch, or the kubelet chowns every file on every
+#     mount (>16 min of ContainerCreating on ayush-workspace).
+#   - Root initContainer chowning /shared: the CephFS CSI driver ignores fsGroup, and
+#     a non-root container otherwise cannot write there. Idempotent.
+#   - V100 and nautilus-ext-gpu01 excluded, log mirrored to the PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-generate-eval
+  labels:
+    app: vlgcbm
+    run: generate-eval
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 10800     # 3h; the work is ~15 min
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: generate-eval
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: fix-shared-perms
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+      containers:
+        - name: eval
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - name: HF_HOME
+              value: /workspace/.cache/huggingface
+            - name: TORCH_HOME
+              value: /workspace/.cache/torch
+            - name: DATASET_FOLDER
+              value: /workspace/VLG-CBM/datasets
+            - name: VLGCBM_BIOCLIP_CKPT
+              value: /workspace/models/bioclip/open_clip_pytorch_model.bin
+            - name: PYTHONPATH
+              value: /opt/eval:/workspace/VLG-CBM
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/generate-eval-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              nvidia-smi --query-gpu=name,memory.total --format=csv
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              echo "checkout: $(git rev-parse --short HEAD)"
+
+              n_img=$(find -L datasets/birds525/val -name '*.jpg' | wc -l)
+              echo "birds525 test images: $n_img"
+              test "$n_img" -ge 2625 || { echo "FATAL: test split incomplete"; exit 1; }
+              n_empty=$(find -L datasets/birds525/val -type f -size 0 | wc -l)
+              test "$n_empty" -eq 0 || { echo "FATAL: $n_empty zero-byte test images"; exit 1; }
+
+              python -W ignore /opt/eval/generate_eval.py \
+                --save_dir saved_models \
+                --out /shared/vlgcbm_eval \
+                --device cuda \
+                --num_workers 2
+
+              echo "===== outputs ====="
+              ls -la /shared/vlgcbm_eval
+              du -sh /shared/vlgcbm_eval
+              echo "===== all done ====="
+          volumeMounts:
+            - name: ml-storage
+              mountPath: /workspace
+            - name: shared
+              mountPath: /shared
+            - name: code
+              mountPath: /opt/eval
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+          # Sized for inference, not training. 4 CPU / 16Gi sat Pending: of the GPU
+          # nodes on the allowlist, 28 had a free GPU but not that much CPU or memory
+          # to go with it. The workload is 2,625 images through a frozen model;
+          # activations for all of them are ~21MB. Small requests reach far more nodes.
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim:
+            claimName: vlgcbm-workspace
+        - name: shared
+          persistentVolumeClaim:
+            claimName: ayush-shared
+        - name: code
+          configMap:
+            name: vlgcbm-generate-eval
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi     # tmpfs counts against the 8Gi memory limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # Match the storage region. vlgcbm-workspace is RBD in the us-west
+                  # pool, and the conda env, HF weight cache and dataset all live on it.
+                  # Without this pin the first attempt landed in Illinois and read the
+                  # env at 0.8 MB/s -- 12 minutes to get partway through importing
+                  # transformers, with the GPU idle. Earlier jobs only avoided this by
+                  # happening to land on us-west nodes. NRP's storage docs ask for
+                  # exactly this affinity.
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values: ["us-west"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A4000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation

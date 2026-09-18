@@ -1,0 +1,241 @@
+# Retrain all six VLG-CBM CBMs on birds525 so they are directly comparable with the
+# LF-CBM CBMs and the black boxes. Four config keys change, nothing else
+# (configs/birds525_v2_<model>.json vs configs/birds525_<model>.json):
+#
+#                 v1 (existing)            v2 (this job)         LF-CBM / black boxes
+#   saga_lam      0.0002                   0.0007                0.0007
+#   saga_n_iters  4000                     1000                  1000
+#   train data    90% of train/            100% of train/        100% of train/
+#   validation    10% carved from train/   test/ (birds525_valid)
+#   test          val/                     val/ (unchanged)      val/
+#
+# test/ is Kaggle's test folder, never used by any pipeline so far. val/ (Kaggle's
+# "valid") stays the reported test set because every existing LF-CBM and black-box
+# number was measured on it.
+#
+# Stages, each failing fast before the expensive one:
+#   1. preflight   code at the pushed commit, PVC resized, data and assets intact
+#   2. annotate    Grounding DINO over test/ -> annotations/birds525_valid (~10-20 min),
+#                  identical settings to the original annotation pass
+#   3. smoke       build the v2 train/val/test loaders and read one batch of each;
+#                  sizes must be 84,635 / 2,625 / 2,625
+#   4. train       six CBMs, bioclip first; completed runs are skipped on retry
+#   5. eval        eval_val.pt for each v2 run + bundles in /shared/vlgcbm_eval_v2
+#
+# Est. ~17-21h: ~2.5-3h per backbone, ~4-5h for bioclip2. bioclip lands after ~3h --
+# check it before the rest run: kubectl logs job/vlgcbm-retrain-v2 | grep -E "=====|acc"
+#
+# NRP compliance, checked 2026-09-18:
+#   - Batch work runs as a Job (not a bare pod), with ttlSecondsAfterFinished cleanup.
+#   - limits == requests for cpu and memory. The admission policy rejects a
+#     limit/request ratio above 1.2 (container-must-meet-memory-and-cpu-ratio).
+#   - Pinned to us-west, matching the rook-ceph-block pool vlgcbm-workspace lives in,
+#     per the storage docs. Unpinned, a job landed in Illinois and read the env at
+#     0.8 MB/s.
+#   - Conda env stays on block storage (vlgcbm-workspace). Installing packages on
+#     CephFS is prohibited; ayush-shared (CephFS) only receives output files.
+#   - GPU: >=16GB, Ampere-or-newer allowlist; V100 excluded (no cuDNN kernel for
+#     ViT-L/14's patch conv) and nautilus-ext-gpu01 excluded (advertises lost GPUs).
+#   - No idle GPU: every stage uses the GPU, and the job exits when done.
+#
+# Submit:  kubectl apply -f k8s/job-retrain-v2.yaml
+# Watch:   kubectl logs -f job/vlgcbm-retrain-v2 | grep -E "=====|acc|FATAL|Error"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-retrain-v2
+  labels:
+    app: vlgcbm
+    run: retrain-v2
+spec:
+  backoffLimit: 3                  # evictions happen; finished stages are skipped on retry
+  activeDeadlineSeconds: 172800    # 48h: ~21h of work plus room for one full retry
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: retrain-v2
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        # the CephFS CSI driver ignores fsGroup; without this the job cannot write to
+        # /shared. Idempotent.
+        - name: fix-shared-perms
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+          securityContext: {runAsUser: 0, runAsGroup: 0}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+          resources:
+            requests: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+      containers:
+        - name: trainer
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - {name: HF_HOME, value: /workspace/.cache/huggingface}
+            - {name: TORCH_HOME, value: /workspace/.cache/torch}
+            - {name: PIP_CACHE_DIR, value: /workspace/.cache/pip}
+            - {name: DATASET_FOLDER, value: /workspace/VLG-CBM/datasets}
+            - {name: VLGCBM_BIOCLIP_CKPT, value: /workspace/models/bioclip/open_clip_pytorch_model.bin}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+            - {name: CODE_REF, value: "origin/bioclip-birds525"}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/retrain-v2-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              echo "===== 1. preflight ====="
+              nvidia-smi --query-gpu=name,memory.total --format=csv
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+
+              # bring the checkout to the pushed commit; refuse anything but a clean
+              # fast-forward rather than silently running stale or mixed code
+              git fetch -q origin
+              git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+              echo "code: $(git rev-parse --short HEAD)"
+              test -f configs/birds525_v2_bioclip.json || { echo "FATAL: v2 configs missing"; exit 1; }
+              grep -q '"birds525_valid"' data/utils.py || { echo "FATAL: birds525_valid split missing"; exit 1; }
+
+              df -h /workspace | tail -1
+              size_g=$(df -BG --output=size /workspace | tail -1 | tr -dc 0-9)
+              test "$size_g" -ge 55 || { echo "FATAL: PVC not resized (${size_g}G < 60G)"; exit 1; }
+
+              for s in train val test; do
+                n=$(find -L datasets/birds525/$s -name '*.jpg' | wc -l); echo "birds525/$s: $n"
+              done
+              test "$(find -L datasets/birds525/train -name '*.jpg' | wc -l)" -eq 84635
+              test "$(find -L datasets/birds525/val -name '*.jpg' | wc -l)" -eq 2625
+              test "$(find -L datasets/birds525/test -name '*.jpg' | wc -l)" -eq 2625
+              n_empty=$(find -L datasets/birds525 -type f -size 0 | wc -l)
+              test "$n_empty" -eq 0 || { echo "FATAL: $n_empty zero-byte images"; exit 1; }
+              python -c "from groundingdino.models.GroundingDINO.ms_deform_attn import _C_AVAILABLE; print('groundingdino ok, _C:', _C_AVAILABLE)"
+              test -f GroundingDINO/groundingdino_swinb_cogcoor.pth || { echo "FATAL: missing Grounding DINO checkpoint"; exit 1; }
+              test "$(ls annotations/birds525_train | wc -l)" -ge 84635 || { echo "FATAL: train annotations incomplete"; exit 1; }
+              mkdir -p saved_models
+
+              echo "===== 2. annotate birds525_valid (test/ folder) ====="
+              # same text_threshold as the original train/val pass, so the concept
+              # labels on the validation split are produced identically
+              python -m scripts.generate_annotations \
+                --dataset birds525_valid --device cuda \
+                --batch_size 8 --num_workers 4 --text_threshold 0.15 \
+                --output_dir annotations --skip_existing
+              n_ann=$(ls annotations/birds525_valid | grep -c '\.json$')
+              echo "birds525_valid annotations: $n_ann"
+              test "$n_ann" -ge 2625 || { echo "FATAL: valid annotations incomplete"; exit 1; }
+
+              echo "===== 3. smoke test: v2 loaders ====="
+              python - <<'PY'
+              import json
+              from data.concept_dataset import get_concept_dataloader
+              import data.utils as du
+              cfg = json.load(open("configs/birds525_v2_bioclip.json"))
+              concepts = du.get_concepts(cfg["concept_set"], cfg["filter_set"])
+              expect = {"train": 84635, "val": 2625, "test": 2625}
+              for split, n in expect.items():
+                  dl = get_concept_dataloader(
+                      cfg["dataset"], split, concepts, preprocess=None,
+                      val_split=None if split == "test" else cfg["val_split"],
+                      batch_size=4, num_workers=0, shuffle=False,
+                      confidence_threshold=cfg["cbl_confidence_threshold"],
+                      label_dir="annotations", concept_only=True)
+                  got = len(dl.dataset)
+                  batch = next(iter(dl))
+                  print(f"  {split}: {got} images, concept batch {tuple(batch[1].shape)}, "
+                        f"positives {int(batch[1].sum())}")
+                  assert got == n, f"{split}: expected {n}, got {got}"
+              print("smoke test passed")
+              PY
+
+              echo "===== 4. train ====="
+              # bioclip first: it lands in ~3h, early enough to catch a problem before
+              # the other five spend a day on it
+              for m in bioclip vit_in21k dino clip_vitb16 rn50 bioclip2; do
+                parent="saved_models/birds525_v2_$m"
+                if ls "$parent"/*/metrics.txt >/dev/null 2>&1; then
+                  echo "===== $m: already complete, skipping ====="
+                  continue
+                fi
+                echo "===== $m ====="
+                start=$(date +%s)
+                python train_cbm.py --config "configs/birds525_v2_$m.json" --annotation_dir annotations
+                run=$(ls -td "$parent"/*/ | head -1)
+                echo "$m finished in $(( ($(date +%s) - start) / 60 )) min -> $run"
+                python -c "
+              import json; m = json.load(open('${run}metrics.txt'))
+              print('  test acc:', m['metrics']['test_accuracy'], '| nonzero:',
+                    m['sparsity']['Non-zero weights'], '/', m['sparsity']['Total weights'])
+              " || true
+              done
+
+              echo "===== 5. eval bundles ====="
+              python -W ignore scripts/generate_eval.py --save_dir saved_models \
+                --out /shared/vlgcbm_eval_v2 --device cuda --num_workers 4 \
+                --only birds525_v2_bioclip birds525_v2_bioclip2 birds525_v2_vit_in21k \
+                       birds525_v2_dino birds525_v2_clip_vitb16 birds525_v2_rn50
+              ls -la /shared/vlgcbm_eval_v2
+              echo "===== all done ====="
+          volumeMounts:
+            - {name: ml-storage, mountPath: /workspace}
+            - {name: shared, mountPath: /shared}
+            - {name: dshm, mountPath: /dev/shm}
+          # 4 CPU / 12Gi: what the earlier training jobs used, and it scheduled in ~40s.
+          # 16Gi sat Pending today -- GPU nodes with that much free memory were scarce.
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim: {claimName: vlgcbm-workspace}
+        - name: shared
+          persistentVolumeClaim: {claimName: ayush-shared}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}   # counts against the 12Gi limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values: ["us-west"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A4000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation

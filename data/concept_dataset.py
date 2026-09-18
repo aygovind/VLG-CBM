@@ -218,6 +218,31 @@ def get_concept_dataloader(
             concept_only=concept_only
         )
         logger.info(f"Test dataset size: {len(dataset)}")
+    elif val_split == 0:
+        # val_split=0: use the dataset's own validation split rather than carving one out
+        # of train. birds525 ships train/valid/test; the carve-out cost 10% of the
+        # training data and was the one respect in which VLG-CBM trained on less than
+        # LF-CBM and the black boxes, which all use 100% of train. Needs a
+        # "<dataset>_valid" entry in DATASET_ROOTS and annotations under
+        # <label_dir>/<dataset>_valid.
+        valid_name = f"{dataset_name}_valid"
+        if valid_name not in data_utils.DATASET_ROOTS:
+            raise ValueError(
+                f"val_split=0 needs a '{valid_name}' split in data/utils.py DATASET_ROOTS")
+        source, suffix = (f"{dataset_name}_train", "train") if split == "train" \
+            else (valid_name, "valid")
+        dataset = dataset(
+            dataset_name,
+            data_utils.get_data(source, None),
+            concepts,
+            split_suffix=suffix,
+            preprocess=preprocess,
+            confidence_threshold=confidence_threshold,
+            crop_to_concept_prob=crop_to_concept_prob,
+            label_dir=label_dir,
+            concept_only=concept_only
+        )
+        logger.info(f"{split.capitalize()} dataset size: {len(dataset)} ({source})")
     else:
         assert val_split is not None
         dataset = dataset(

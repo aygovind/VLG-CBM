@@ -1,0 +1,135 @@
+# Verify the ayush-shared RWX volume actually behaves as ReadWriteMany.
+#
+# The test that matters is not "does it mount" -- an RWO volume mounts too. It is
+# "do two pods on two different nodes hold it at the same time", which is the single
+# property being bought here. So this runs 2 parallel pods that each write a file and
+# then wait to see the OTHER pod's file. If both succeed, the volumes were genuinely
+# co-mounted; an RWO volume would leave one pod stuck in ContainerCreating and the
+# other timing out on its wait.
+#
+# No GPU: this is a storage test, and requesting a GPU would queue it behind real work
+# for no reason.
+#
+# Runs in ~1 minute. Submit after the PVC is Bound:
+#   kubectl apply -f k8s/pvc-shared-rwx.yaml
+#   kubectl get pvc ayush-shared          # wait for Bound
+#   kubectl apply -f k8s/job-test-rwx.yaml
+#   kubectl logs -l run=test-rwx --prefix --tail=-1
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-test-rwx
+  labels:
+    app: vlgcbm
+    run: test-rwx
+spec:
+  completions: 2
+  parallelism: 2            # the whole point: both must run concurrently
+  completionMode: Indexed   # gives each pod a stable JOB_COMPLETION_INDEX
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: test-rwx
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        # Without this the kubelet chowns every file on the volume one by one on every
+        # mount. On the 93k-file ayush-workspace that took >16 minutes of
+        # ContainerCreating. Harmless on an empty volume, essential once it has data.
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        # The CephFS CSI driver does not honour fsGroup the way the RBD one does: a fresh
+        # rook-cephfs volume comes up owned by root, and the unprivileged container above
+        # then cannot even mkdir in it ("Permission denied" on first run here). Chown the
+        # root once, as root, before the real container starts. This is idempotent and
+        # costs a second, so every job mounting this volume should carry it -- or it can
+        # be dropped once the volume has been chowned a single time.
+        - name: fix-perms
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared && ls -ld /shared"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+              ephemeral-storage: "1Gi"
+            limits:
+              cpu: "100m"
+              memory: "256Mi"
+              ephemeral-storage: "1Gi"
+      containers:
+        - name: test
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              ME="${JOB_COMPLETION_INDEX}"
+              DIR=/shared/_rwx_test
+              mkdir -p "$DIR"
+
+              echo "=== pod index $ME on $(hostname), node ${NODE_NAME} ==="
+              df -h /shared | tail -1
+
+              echo "--- write ---"
+              echo "written by index $ME from $(hostname) at $(date -Is)" > "$DIR/pod-$ME.txt"
+              # 200MB, to confirm real throughput rather than just metadata operations
+              dd if=/dev/zero of="$DIR/blob-$ME.bin" bs=1M count=200 2>&1 | tail -1
+
+              echo "--- waiting to see the other pod's file (proves concurrent mount) ---"
+              OTHER=$(( 1 - ME ))
+              for i in $(seq 1 60); do
+                if [ -f "$DIR/pod-$OTHER.txt" ]; then
+                  echo "SAW pod-$OTHER.txt after ${i}0s:"
+                  cat "$DIR/pod-$OTHER.txt"
+                  echo
+                  echo "=== RWX CONFIRMED: both pods held the volume simultaneously ==="
+                  # index 0 cleans up; index 1 has already read what it needed
+                  if [ "$ME" = "0" ]; then sleep 15; rm -rf "$DIR"; echo "cleaned up $DIR"; fi
+                  exit 0
+                fi
+                sleep 10
+              done
+
+              echo "FATAL: never saw pod-$OTHER.txt after 600s."
+              echo "The other pod did not run concurrently -- check whether it is stuck"
+              echo "in ContainerCreating, which is what an RWO volume would cause."
+              ls -la "$DIR"
+              exit 1
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          # NRP policy rejects a limit/request ratio above 1.2 on both cpu and memory
+          # ("container-must-meet-memory-and-cpu-ratio"), so limits match requests here.
+          # Worth checking against the other job yamls in this directory, which predate
+          # that policy and request 4 CPU / 12Gi against 6 CPU / 16Gi limits.
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+              ephemeral-storage: "2Gi"
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: ayush-shared

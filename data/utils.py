@@ -35,6 +35,11 @@ DATASET_ROOTS = {
     # get_concept_dataloader using args.val_split.
     "birds525_train": f"{DATASET_FOLDER}/birds525/train",
     "birds525_val": f"{DATASET_FOLDER}/birds525/val",
+    # Validation split for configs with val_split=0. It points at Kaggle's test/ folder
+    # on purpose: val/ (Kaggle's "valid") is the set every LF-CBM and black-box result
+    # was reported on, so it stays the test set to keep all numbers comparable, and the
+    # otherwise-unused test/ takes the validation role. Both are 5 images/class, iid.
+    "birds525_valid": f"{DATASET_FOLDER}/birds525/test",
     "treeoflife_train": f"{DATASET_FOLDER}/treeoflife/train",
     "treeoflife_val": f"{DATASET_FOLDER}/treeoflife/val",
     # First 5 classes of birds525, symlinked. Annotating and training on it takes
