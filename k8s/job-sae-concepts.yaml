@@ -1,0 +1,292 @@
+# VLG-CBM on birds525 with an SAE-derived concept set (the M-CBM idea: concepts are
+# named SAE latents rather than LLM proposals), against the standard concept set as
+# control. Same backbone (vit_in21k), same v2 settings, same splits -- only the
+# concept set and therefore the Grounding DINO annotations differ:
+#
+#                    SAE run                               control
+#   config           birds525sae_v2_vit_in21k.json         birds525_v2_vit_in21k.json
+#   concept set      birds525sae_filtered.txt (937)        birds525_filtered.txt (2012)
+#   annotations      annotations_sae/ (made here)          annotations/ (existing)
+#
+# The SAE concept files come from scripts/merge_concept_sets.py --sae_only. The class
+# "looney birds" has no SAE concepts (absent from the SAE's dataset copy); it stays in
+# training and stage 6 reports accuracy with and without its 5 test images.
+#
+# Stages, each failing fast before the expensive one:
+#   1. preflight   code at the pushed commit, data and assets intact, every class
+#                  prompt fits Grounding DINO's 256-token window
+#   2. annotate    val/ and test/ (2,625 images each, minutes), then a coverage gate:
+#                  the job stops here if Grounding DINO grounds too few SAE concepts,
+#                  before the ~4h train/ pass. --skip_existing resumes after eviction.
+#   3. smoke       build the train/val/test loaders on the SAE annotations
+#   4. train SAE   ~3h
+#   5. control     reuses the finished birds525_v2_vit_in21k run if there is one
+#                  (identical config and seed), otherwise trains it (~3h)
+#   6. eval        bundles in /shared/vlgcbm_eval_sae + side-by-side summary
+#
+# Est. ~7-8h to the SAE result, ~10-11h if the control has to be trained.
+#
+# Submit:  kubectl apply -f k8s/job-sae-concepts.yaml
+# Watch:   kubectl logs -f job/vlgcbm-sae-concepts | grep -E "=====|acc|coverage|FATAL|Error"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-sae-concepts
+  labels:
+    app: vlgcbm
+    run: sae-concepts
+spec:
+  backoffLimit: 3                  # evictions happen; finished stages are skipped on retry
+  activeDeadlineSeconds: 172800    # 48h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: sae-concepts
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        # the CephFS CSI driver ignores fsGroup; without this the job cannot write to
+        # /shared. Idempotent.
+        - name: fix-shared-perms
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+          securityContext: {runAsUser: 0, runAsGroup: 0}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+          resources:
+            requests: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+      containers:
+        - name: trainer
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - {name: HF_HOME, value: /workspace/.cache/huggingface}
+            - {name: TORCH_HOME, value: /workspace/.cache/torch}
+            - {name: PIP_CACHE_DIR, value: /workspace/.cache/pip}
+            - {name: DATASET_FOLDER, value: /workspace/VLG-CBM/datasets}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+            - {name: CODE_REF, value: "origin/bioclip-birds525"}
+            - {name: SAE_CFG, value: "configs/birds525sae_v2_vit_in21k.json"}
+            - {name: CTRL_CFG, value: "configs/birds525_v2_vit_in21k.json"}
+            - {name: SAE_PER_CLASS, value: "concept_files/birds525sae_per_class.json"}
+            - {name: SAE_ANN, value: "annotations_sae"}
+            # stage 2 stops the job if fewer than this share of SAE concepts is
+            # grounded at least once on val/
+            - {name: MIN_COVERAGE, value: "0.2"}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/sae-concepts-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              echo "===== 1. preflight ====="
+              nvidia-smi --query-gpu=name,memory.total --format=csv
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+
+              # bring the checkout to the pushed commit; refuse anything but a clean
+              # fast-forward rather than silently running stale or mixed code
+              git fetch -q origin
+              git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+              echo "code: $(git rev-parse --short HEAD)"
+              for f in "$SAE_CFG" "$CTRL_CFG" "$SAE_PER_CLASS" concept_files/birds525sae_filtered.txt; do
+                test -f "$f" || { echo "FATAL: missing $f"; exit 1; }
+              done
+
+              df -h /workspace | tail -1
+              test "$(find -L datasets/birds525/train -name '*.jpg' | wc -l)" -eq 84635
+              test "$(find -L datasets/birds525/val -name '*.jpg' | wc -l)" -eq 2625
+              test "$(find -L datasets/birds525/test -name '*.jpg' | wc -l)" -eq 2625
+              python -c "from groundingdino.models.GroundingDINO.ms_deform_attn import _C_AVAILABLE; print('groundingdino ok, _C:', _C_AVAILABLE)"
+              test -f GroundingDINO/groundingdino_swinb_cogcoor.pth || { echo "FATAL: missing Grounding DINO checkpoint"; exit 1; }
+              mkdir -p saved_models "$SAE_ANN"
+
+              # Grounding DINO truncates the prompt at 256 tokens without saying so, and
+              # a concept is matched by its decoded text, so check both before annotating
+              python - <<'PY'
+              import json, os
+              from transformers import AutoTokenizer
+              from data.utils import format_concept
+              tok = AutoTokenizer.from_pretrained("bert-base-uncased")
+              per_class = json.load(open(os.environ["SAE_PER_CLASS"]))
+              classes = open("concept_files/birds525_classes.txt").read().split("\n")
+              longest, bad = 0, set()
+              for cls in classes:
+                  prompt = " . ".join([format_concept(cls)] + [format_concept(c) for c in per_class[cls]]) + " ."
+                  longest = max(longest, len(tok(prompt)["input_ids"]))
+                  for c in per_class[cls]:
+                      c = format_concept(c)
+                      if format_concept(tok.decode(tok(c)["input_ids"][1:-1])) != c:
+                          bad.add(c)
+              print(f"classes: {len(classes)}  longest prompt: {longest} tokens  round-trip mismatches: {len(bad)}")
+              for c in sorted(bad):
+                  print("  WARNING, will never be matched:", c)
+              assert longest <= 256, "a class prompt exceeds Grounding DINO's 256-token window"
+              PY
+
+              echo "===== 2. annotate with the SAE prompts ====="
+              annotate() {  # $1 = dataset split name, $2 = expected image count
+                if [ "$(ls "$SAE_ANN/$1" 2>/dev/null | grep -c '\.json$')" -ge "$2" ]; then
+                  echo "$1: already complete, skipping"; return
+                fi
+                # same settings as the original birds525 annotation pass
+                python -m scripts.generate_annotations \
+                  --dataset "$1" --device cuda \
+                  --per_class_concept_file "$SAE_PER_CLASS" \
+                  --batch_size 8 --num_workers 4 --text_threshold 0.15 \
+                  --output_dir "$SAE_ANN" --skip_existing
+                n_ann=$(ls "$SAE_ANN/$1" | grep -c '\.json$')
+                echo "$1 annotations: $n_ann"
+                test "$n_ann" -ge "$2" || { echo "FATAL: $1 annotations incomplete"; exit 1; }
+              }
+              annotate birds525_val 2625
+              annotate birds525_valid 2625
+
+              # coverage gate: a concept Grounding DINO never grounds is dropped at train
+              # time, so if most of the set is ungroundable the SAE run is not worth 7h
+              python - <<'PY'
+              import collections, glob, json, os
+              from data.utils import format_concept
+              concepts = [c for c in open("concept_files/birds525sae_filtered.txt").read().split("\n") if c]
+              known, hits, per_image = set(concepts), collections.Counter(), []
+              files = glob.glob(os.path.join(os.environ["SAE_ANN"], "birds525_val", "*.json"))
+              for p in files:
+                  found = {format_concept(a["label"]) for a in json.load(open(p))[1:] if a["logit"] > 0.15} & known
+                  hits.update(found)
+                  per_image.append(len(found))
+              cov = len(hits) / len(concepts)
+              print(f"coverage on val: {len(hits)}/{len(concepts)} concepts grounded at least once ({cov:.1%})")
+              print(f"concepts per image: mean {sum(per_image) / len(per_image):.2f}, "
+                    f"images with none: {sum(n == 0 for n in per_image)}/{len(files)}")
+              print("most grounded:", hits.most_common(8))
+              floor = float(os.environ["MIN_COVERAGE"])
+              assert cov >= floor, f"FATAL: coverage {cov:.1%} is below MIN_COVERAGE {floor:.0%}"
+              PY
+
+              annotate birds525_train 84635
+
+              echo "===== 3. smoke test: loaders on the SAE annotations ====="
+              python - <<'PY'
+              import json, os
+              from data.concept_dataset import get_concept_dataloader
+              import data.utils as du
+              cfg = json.load(open(os.environ["SAE_CFG"]))
+              concepts = du.get_concepts(cfg["concept_set"], cfg["filter_set"])
+              expect = {"train": 84635, "val": 2625, "test": 2625}
+              for split, n in expect.items():
+                  dl = get_concept_dataloader(
+                      cfg["dataset"], split, concepts, preprocess=None,
+                      val_split=None if split == "test" else cfg["val_split"],
+                      batch_size=4, num_workers=0, shuffle=False,
+                      confidence_threshold=cfg["cbl_confidence_threshold"],
+                      label_dir=os.environ["SAE_ANN"], concept_only=True)
+                  got = len(dl.dataset)
+                  batch = next(iter(dl))
+                  print(f"  {split}: {got} images, concept batch {tuple(batch[1].shape)}, "
+                        f"positives {int(batch[1].sum())}")
+                  assert got == n, f"{split}: expected {n}, got {got}"
+              print("smoke test passed")
+              PY
+
+              train() {  # $1 = config, $2 = annotation dir
+                parent=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['save_dir'])" "$1")
+                if ls "$parent"/*/metrics.txt >/dev/null 2>&1; then
+                  echo "$parent: already complete, skipping"
+                else
+                  start=$(date +%s)
+                  python train_cbm.py --config "$1" --annotation_dir "$2"
+                  echo "$parent finished in $(( ($(date +%s) - start) / 60 )) min"
+                fi
+                run=$(ls -td "$parent"/*/ | head -1)
+                python -c "
+              import json; m = json.load(open('${run}metrics.txt'))
+              print('  test acc:', m['metrics']['test_accuracy'], '| nonzero:',
+                    m['sparsity']['Non-zero weights'], '/', m['sparsity']['Total weights'])
+              " || true
+              }
+
+              echo "===== 4. train: SAE concept set ====="
+              train "$SAE_CFG" "$SAE_ANN"
+
+              echo "===== 5. control: standard concept set ====="
+              train "$CTRL_CFG" annotations
+
+              echo "===== 6. eval bundles + summary ====="
+              python -W ignore scripts/generate_eval.py --save_dir saved_models \
+                --out /shared/vlgcbm_eval_sae --device cuda --num_workers 4 \
+                --only birds525sae_v2_vit_in21k birds525_v2_vit_in21k
+              python - <<'PY'
+              import torch
+              for name in ("birds525sae_v2_vit_in21k", "birds525_v2_vit_in21k"):
+                  b = torch.load(f"/shared/vlgcbm_eval_sae/{name}.pt", map_location="cpu")
+                  keep = b["labels"] != b["classes"].index("looney birds")
+                  nonzero = int((b["W_g"] != 0).sum())
+                  print(f"{name}: acc {b['correct'].float().mean():.4f} | "
+                        f"acc without looney birds {b['correct'][keep].float().mean():.4f} | "
+                        f"concepts {len(b['concepts'])} | nonzero weights {nonzero} "
+                        f"({nonzero / len(b['classes']):.1f} per class)")
+              PY
+              ls -la /shared/vlgcbm_eval_sae
+              echo "===== all done ====="
+          volumeMounts:
+            - {name: ml-storage, mountPath: /workspace}
+            - {name: shared, mountPath: /shared}
+            - {name: dshm, mountPath: /dev/shm}
+          # 4 CPU / 12Gi: what the earlier training jobs used, and it scheduled in ~40s.
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim: {claimName: vlgcbm-workspace}
+        - name: shared
+          persistentVolumeClaim: {claimName: ayush-shared}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}   # counts against the 12Gi limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values: ["us-west"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                  # >=16GB: Grounding DINO SwinB at batch 8 wants ~11GB
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A4000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation
