@@ -15,16 +15,16 @@
 # Stages, each failing fast before the expensive one:
 #   1. preflight   code at the pushed commit, data and assets intact, every class
 #                  prompt fits Grounding DINO's 256-token window
-#   2. annotate    val/ and test/ (2,625 images each, minutes), then a coverage gate:
+#   2. annotate    val/ and test/ (2,625 images each, minutes; test/ also with the
+#                  standard prompts, for the control), then a coverage gate:
 #                  the job stops here if Grounding DINO grounds too few SAE concepts,
 #                  before the ~4h train/ pass. --skip_existing resumes after eviction.
 #   3. smoke       build the train/val/test loaders on the SAE annotations
 #   4. train SAE   ~3h
-#   5. control     reuses the finished birds525_v2_vit_in21k run if there is one
-#                  (identical config and seed), otherwise trains it (~3h)
+#   5. control     trains birds525_v2_vit_in21k (~3h); skipped if already complete
 #   6. eval        bundles in /shared/vlgcbm_eval_sae + side-by-side summary
 #
-# Est. ~7-8h to the SAE result, ~10-11h if the control has to be trained.
+# Est. ~8h to the SAE result, ~11-12h in total.
 #
 # Submit:  kubectl apply -f k8s/job-sae-concepts.yaml
 # Watch:   kubectl logs -f job/vlgcbm-sae-concepts | grep -E "=====|acc|coverage|FATAL|Error"
@@ -76,6 +76,8 @@ spec:
             - {name: CTRL_CFG, value: "configs/birds525_v2_vit_in21k.json"}
             - {name: SAE_PER_CLASS, value: "concept_files/birds525sae_per_class.json"}
             - {name: SAE_ANN, value: "annotations_sae"}
+            - name: GD_CKPT_URL
+              value: https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
             # stage 2 stops the job if fewer than this share of SAE concepts is
             # grounded at least once on val/
             - {name: MIN_COVERAGE, value: "0.2"}
@@ -108,7 +110,16 @@ spec:
               test "$(find -L datasets/birds525/val -name '*.jpg' | wc -l)" -eq 2625
               test "$(find -L datasets/birds525/test -name '*.jpg' | wc -l)" -eq 2625
               python -c "from groundingdino.models.GroundingDINO.ms_deform_attn import _C_AVAILABLE; print('groundingdino ok, _C:', _C_AVAILABLE)"
-              test -f GroundingDINO/groundingdino_swinb_cogcoor.pth || { echo "FATAL: missing Grounding DINO checkpoint"; exit 1; }
+              # the checkpoint has gone missing from the volume before; refetch it from the
+              # release setup.txt installs it from, to a temp name so a cut-off download
+              # is never mistaken for the real file
+              GD_CKPT=GroundingDINO/groundingdino_swinb_cogcoor.pth
+              if [ ! -f "$GD_CKPT" ]; then
+                echo "Grounding DINO checkpoint missing, downloading"
+                wget -nv -O "$GD_CKPT.part" "$GD_CKPT_URL"
+                mv "$GD_CKPT.part" "$GD_CKPT"
+              fi
+              test "$(stat -c %s "$GD_CKPT")" -gt 900000000 || { echo "FATAL: Grounding DINO checkpoint is truncated"; exit 1; }
               mkdir -p saved_models "$SAE_ANN"
 
               # Grounding DINO truncates the prompt at 256 tokens without saying so, and
@@ -135,22 +146,22 @@ spec:
               PY
 
               echo "===== 2. annotate with the SAE prompts ====="
-              annotate() {  # $1 = dataset split name, $2 = expected image count
-                if [ "$(ls "$SAE_ANN/$1" 2>/dev/null | grep -c '\.json$')" -ge "$2" ]; then
-                  echo "$1: already complete, skipping"; return
+              annotate() {  # $1 = split, $2 = expected image count, $3 = per-class file, $4 = output dir
+                if [ "$(ls "$4/$1" 2>/dev/null | grep -c '\.json$')" -ge "$2" ]; then
+                  echo "$4/$1: already complete, skipping"; return
                 fi
                 # same settings as the original birds525 annotation pass
                 python -m scripts.generate_annotations \
                   --dataset "$1" --device cuda \
-                  --per_class_concept_file "$SAE_PER_CLASS" \
+                  --per_class_concept_file "$3" \
                   --batch_size 8 --num_workers 4 --text_threshold 0.15 \
-                  --output_dir "$SAE_ANN" --skip_existing
-                n_ann=$(ls "$SAE_ANN/$1" | grep -c '\.json$')
-                echo "$1 annotations: $n_ann"
-                test "$n_ann" -ge "$2" || { echo "FATAL: $1 annotations incomplete"; exit 1; }
+                  --output_dir "$4" --skip_existing
+                n_ann=$(ls "$4/$1" | grep -c '\.json$')
+                echo "$4/$1 annotations: $n_ann"
+                test "$n_ann" -ge "$2" || { echo "FATAL: $4/$1 annotations incomplete"; exit 1; }
               }
-              annotate birds525_val 2625
-              annotate birds525_valid 2625
+              annotate birds525_val 2625 "$SAE_PER_CLASS" "$SAE_ANN"
+              annotate birds525_valid 2625 "$SAE_PER_CLASS" "$SAE_ANN"
 
               # coverage gate: a concept Grounding DINO never grounds is dropped at train
               # time, so if most of the set is ungroundable the SAE run is not worth 7h
@@ -173,7 +184,12 @@ spec:
               assert cov >= floor, f"FATAL: coverage {cov:.1%} is below MIN_COVERAGE {floor:.0%}"
               PY
 
-              annotate birds525_train 84635
+              # the control validates on test/ too (v2 settings), and that split was never
+              # annotated with the standard prompts. Done here rather than in stage 5 so
+              # a problem with it surfaces now, not after the SAE run.
+              annotate birds525_valid 2625 concept_files/birds525_per_class.json annotations
+
+              annotate birds525_train 84635 "$SAE_PER_CLASS" "$SAE_ANN"
 
               echo "===== 3. smoke test: loaders on the SAE annotations ====="
               python - <<'PY'
