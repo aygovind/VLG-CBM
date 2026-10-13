@@ -8,14 +8,16 @@ pre-defined files:
     concept_files/<sae_name>_per_class.json      SAE concepts -> Grounding DINO prompt
     concept_files/<merged_name>_filtered.txt     pre-defined + non-overlapping SAE
     concept_files/<merged_name>_per_class.json   union of both per-class lists
-    concept_files/<merged_name>_aliases.json     SAE concept -> pre-defined concept it
-                                                 was folded into
+    concept_files/<merged_name>_aliases.json     every SAE concept that was folded ->
+                                                 the concept it goes by in the merged set
 
 Two concepts count as the same when the cosine similarity of their text embeddings
 exceeds --threshold. Within the SAE set the earlier (higher-ranked) concept is kept;
 between the two sets the pre-defined wording wins. The aliases file exists because
-annotations made with the SAE prompts carry the SAE wording, so reusing them for the
-merged model needs those labels renamed.
+annotations made with the SAE prompts carry the original SAE wording, so reusing them
+for the merged model (scripts/merge_annotations.py) needs those labels renamed -- both
+the near-duplicates folded inside the SAE set and the ones folded into the pre-defined
+set.
 
 The class list is the base dataset's (<base>_classes.txt): the SAE and merged sets
 are alternative concept sets for the same dataset, not new datasets.
@@ -175,8 +177,10 @@ def main():
             c: unique(base_per_class.get(c, []) + [aliases.get(x, x) for x in sae_per_class[c]]) for c in classes
         }
         write(merged_name, merged, merged_per_class)
+        renames = {c: aliases.get(folded.get(c, c), folded.get(c, c)) for c in sae}
+        renames = {c: new for c, new in renames.items() if new != c}
         with open(os.path.join(output_dir, f"{merged_name}_aliases.json"), "w") as f:
-            json.dump(aliases, f, indent=1)
+            json.dump(renames, f, indent=1)
         print(f"merged: {len(base)} pre-defined + {len(sae_final) - len(aliases)} SAE "
               f"({len(aliases)} overlapping) = {len(merged)}")
         print(f"concepts per class  {merged_name}: {sizes(merged_per_class)}")

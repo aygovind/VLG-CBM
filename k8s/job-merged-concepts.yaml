@@ -1,0 +1,212 @@
+# VLG-CBM on birds525 with the merged concept set: the standard set plus the SAE
+# concepts that do not duplicate it (scripts/merge_concept_sets.py, threshold 0.95 ->
+# 2012 + 863 = 2875 concepts). Third arm of the comparison started by
+# k8s/job-sae-concepts.yaml, and identical to its two runs in everything but the
+# concept set: same backbone (vit_in21k), v2 settings, splits and seed.
+#
+# No Grounding DINO pass. Both halves of the merged set were annotated by that job, so
+# annotations_merged/ is built by scripts/merge_annotations.py as the union of
+# annotations/ and annotations_sae/ -- the merged model is supervised by exactly the
+# detections the two single-set models were.
+#
+# Stages:
+#   1. preflight   code at the pushed commit, both source annotation sets complete
+#   2. merge       annotations_merged/ for train, val and test/ (~10 min, resumable)
+#   3. smoke       build the train/val/test loaders on the merged annotations
+#   4. train       ~3h; skipped if already complete
+#   5. eval        bundles in /shared/vlgcbm_eval_sae + three-way summary
+#
+# Submit:  kubectl apply -f k8s/job-merged-concepts.yaml
+# Watch:   kubectl logs -f job/vlgcbm-merged-concepts | grep -E "=====|test acc|finished in|FATAL|Traceback"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-merged-concepts
+  labels:
+    app: vlgcbm
+    run: merged-concepts
+spec:
+  backoffLimit: 3                  # evictions happen; finished stages are skipped on retry
+  activeDeadlineSeconds: 172800    # 48h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: merged-concepts
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        # the CephFS CSI driver ignores fsGroup; without this the job cannot write to
+        # /shared. Idempotent.
+        - name: fix-shared-perms
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+          securityContext: {runAsUser: 0, runAsGroup: 0}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+          resources:
+            requests: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+      containers:
+        - name: trainer
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - {name: HF_HOME, value: /workspace/.cache/huggingface}
+            - {name: TORCH_HOME, value: /workspace/.cache/torch}
+            - {name: PIP_CACHE_DIR, value: /workspace/.cache/pip}
+            - {name: DATASET_FOLDER, value: /workspace/VLG-CBM/datasets}
+            - {name: TOKENIZERS_PARALLELISM, value: "false"}
+            - {name: CODE_REF, value: "origin/bioclip-birds525"}
+            - {name: CFG, value: "configs/birds525merged_v2_vit_in21k.json"}
+            - {name: ANN, value: "annotations_merged"}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/merged-concepts-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              echo "===== 1. preflight ====="
+              nvidia-smi --query-gpu=name,memory.total --format=csv
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+
+              # bring the checkout to the pushed commit; refuse anything but a clean
+              # fast-forward rather than silently running stale or mixed code
+              git fetch -q origin
+              git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+              echo "code: $(git rev-parse --short HEAD)"
+              for f in "$CFG" concept_files/birds525merged_filtered.txt concept_files/birds525merged_aliases.json; do
+                test -f "$f" || { echo "FATAL: missing $f"; exit 1; }
+              done
+              df -h /workspace | tail -1
+              for d in annotations annotations_sae; do
+                for s in birds525_train:84635 birds525_val:2625 birds525_valid:2625; do
+                  n=$(ls "$d/${s%%:*}" | grep -c '\.json$')
+                  echo "$d/${s%%:*}: $n"
+                  test "$n" -eq "${s##*:}" || { echo "FATAL: $d/${s%%:*} is incomplete"; exit 1; }
+                done
+              done
+              for r in birds525sae_v2_vit_in21k birds525_v2_vit_in21k; do
+                ls saved_models/$r/*/metrics.txt >/dev/null || { echo "FATAL: no finished run for $r to compare against"; exit 1; }
+              done
+
+              echo "===== 2. merge annotations ====="
+              python -m scripts.merge_annotations --base annotations --extra annotations_sae \
+                --aliases concept_files/birds525merged_aliases.json --out "$ANN" \
+                --splits birds525_val birds525_valid birds525_train
+              for s in birds525_train:84635 birds525_val:2625 birds525_valid:2625; do
+                n=$(ls "$ANN/${s%%:*}" | grep -c '\.json$')
+                test "$n" -eq "${s##*:}" || { echo "FATAL: $ANN/${s%%:*} has $n files"; exit 1; }
+              done
+
+              echo "===== 3. smoke test: loaders on the merged annotations ====="
+              python - <<'PY'
+              import json, os
+              from data.concept_dataset import get_concept_dataloader
+              import data.utils as du
+              cfg = json.load(open(os.environ["CFG"]))
+              concepts = du.get_concepts(cfg["concept_set"], cfg["filter_set"])
+              expect = {"train": 84635, "val": 2625, "test": 2625}
+              for split, n in expect.items():
+                  dl = get_concept_dataloader(
+                      cfg["dataset"], split, concepts, preprocess=None,
+                      val_split=None if split == "test" else cfg["val_split"],
+                      batch_size=4, num_workers=0, shuffle=False,
+                      confidence_threshold=cfg["cbl_confidence_threshold"],
+                      label_dir=os.environ["ANN"], concept_only=True)
+                  got = len(dl.dataset)
+                  batch = next(iter(dl))
+                  print(f"  {split}: {got} images, concept batch {tuple(batch[1].shape)}, "
+                        f"positives {int(batch[1].sum())}")
+                  assert got == n, f"{split}: expected {n}, got {got}"
+              print("smoke test passed")
+              PY
+
+              echo "===== 4. train: merged concept set ====="
+              parent=saved_models/birds525merged_v2_vit_in21k
+              if ls "$parent"/*/metrics.txt >/dev/null 2>&1; then
+                echo "$parent: already complete, skipping"
+              else
+                start=$(date +%s)
+                python train_cbm.py --config "$CFG" --annotation_dir "$ANN"
+                echo "$parent finished in $(( ($(date +%s) - start) / 60 )) min"
+              fi
+
+              echo "===== 5. eval bundles + summary ====="
+              python -W ignore scripts/generate_eval.py --save_dir saved_models \
+                --out /shared/vlgcbm_eval_sae --device cuda --num_workers 4 \
+                --only birds525merged_v2_vit_in21k birds525sae_v2_vit_in21k birds525_v2_vit_in21k
+              python - <<'PY'
+              import torch
+              for name in ("birds525sae_v2_vit_in21k", "birds525_v2_vit_in21k", "birds525merged_v2_vit_in21k"):
+                  b = torch.load(f"/shared/vlgcbm_eval_sae/{name}.pt", map_location="cpu")
+                  keep = b["labels"] != b["classes"].index("looney birds")
+                  nonzero = int((b["W_g"] != 0).sum())
+                  print(f"{name}: test acc {b['correct'].float().mean():.4f} | "
+                        f"without looney birds {b['correct'][keep].float().mean():.4f} | "
+                        f"concepts {len(b['concepts'])} | nonzero weights {nonzero} "
+                        f"({nonzero / len(b['classes']):.1f} per class)")
+              PY
+              ls -la /shared/vlgcbm_eval_sae
+              echo "===== all done ====="
+          volumeMounts:
+            - {name: ml-storage, mountPath: /workspace}
+            - {name: shared, mountPath: /shared}
+            - {name: dshm, mountPath: /dev/shm}
+          # 4 CPU / 12Gi: what the earlier training jobs used, and it scheduled in ~40s.
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "12Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim: {claimName: vlgcbm-workspace}
+        - name: shared
+          persistentVolumeClaim: {claimName: ayush-shared}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}   # counts against the 12Gi limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values: ["us-west"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - v100-cc-star-01.noc.ucsb.edu
+                      - nautilus-ext-gpu01.fullerton.edu
+                  # same pool as the two runs this is compared with
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-A10
+                      - NVIDIA-RTX-A4000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-L4
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      - NVIDIA-RTX-5000-Ada-Generation
+                      - NVIDIA-RTX-4000-Ada-Generation
