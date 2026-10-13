@@ -82,6 +82,12 @@ spec:
               # bring the checkout to the pushed commit; refuse anything but a clean
               # fast-forward rather than silently running stale or mixed code
               git fetch -q origin
+              # scripts/qualitative_report.py was hand-copied onto the volume before it was
+              # committed, and an untracked file in the way blocks the merge. Set the copy
+              # aside rather than deleting it.
+              if [ -f scripts/qualitative_report.py ] && ! git ls-files --error-unmatch scripts/qualitative_report.py >/dev/null 2>&1; then
+                mv scripts/qualitative_report.py "/workspace/logs/qualitative_report.py.untracked-$(date +%Y%m%d-%H%M%S)"
+              fi
               git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
               echo "code: $(git rev-parse --short HEAD)"
               for f in "$CFG" concept_files/birds525merged_filtered.txt concept_files/birds525merged_aliases.json; do
