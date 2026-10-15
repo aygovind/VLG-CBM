@@ -1,0 +1,144 @@
+# Grounding DINO annotations of the CUB test set for the paper's VLG-CBM model
+# (concept_faithfulness.md, option B): each test image is checked for the concepts its
+# true class and its predicted class use -- "is what the decision rests on visible?".
+# Same detector and settings as the training pass (class name leads the prompt,
+# text_threshold 0.15), via scripts/annotate_concepts.py.
+#
+# Stages: preflight, a 16-image test run (stops if it finds nothing), the full 5,790
+# images (~40 min on a 16GB card; resumes after an eviction), then a tarball to
+# /shared/vlgcbm_eval_paper/ for local analysis.
+#
+# Submit:  kubectl apply -f k8s/job-annotate-cub-test.yaml
+# Watch:   kubectl logs -f job/vlgcbm-annotate-cub-test | grep -E "=====|annotated|FATAL|Traceback|it/s"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-annotate-cub-test
+  labels:
+    app: vlgcbm
+    run: annotate-cub-test
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: annotate-cub-test
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+      - name: fix-shared-perms
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        command:
+        - /bin/bash
+        - -c
+        - chown 1000:100 /shared && chmod 0775 /shared
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+            ephemeral-storage: 1Gi
+          limits:
+            cpu: 100m
+            memory: 256Mi
+            ephemeral-storage: 1Gi
+      containers:
+      - name: annotator
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        env:
+        - name: HF_HOME
+          value: /workspace/.cache/huggingface
+        - name: TORCH_HOME
+          value: /workspace/.cache/torch
+        - name: PIP_CACHE_DIR
+          value: /workspace/.cache/pip
+        - name: DATASET_FOLDER
+          value: /workspace/VLG-CBM/datasets
+        - name: TOKENIZERS_PARALLELISM
+          value: 'false'
+        - name: CODE_REF
+          value: origin/bioclip-birds525
+        - name: BUNDLE
+          value: /shared/vlgcbm_eval_paper/cub.pt
+        - name: OUT_DIR
+          value: annotations_cub_decision
+        - name: SHARED_OUT
+          value: /shared/vlgcbm_eval_paper/annotations_cub_decision.tar.gz
+        command:
+        - /bin/bash
+        - -c
+        args:
+        - "set -eo pipefail\nmkdir -p /workspace/logs\nLOGFILE=/workspace/logs/annotate-cub-test-$(date +%Y%m%d-%H%M%S).log\nexec > >(tee -a \"$LOGFILE\") 2>&1\necho \"mirroring this log to $LOGFILE\"\n\necho \"===== 1. preflight =====\"\nnvidia-smi --query-gpu=name,memory.total --format=csv\nsource /opt/conda/etc/profile.d/conda.sh\nconda activate /workspace/envs/vlgcbm\ncd /workspace/VLG-CBM\ngit fetch -q origin\n# files hand-copied onto the volume before they were committed block the fast-forward\nfor f in $(git diff --name-only --diff-filter=A HEAD \"$CODE_REF\"); do\n  if [ -f \"$f\" ] && ! git ls-files --error-unmatch \"$f\" >/dev/null 2>&1; then\n    echo \"setting aside untracked $f\"; mv \"$f\" \"/workspace/logs/$(basename \"$f\").untracked-$(date +%Y%m%d-%H%M%S)\"\n  fi\ndone\ngit merge --ff-only \"$CODE_REF\" || { echo \"FATAL: checkout cannot fast-forward to $CODE_REF\"; git status --short; exit 1; }\necho \"code: $(git rev-parse --short HEAD)\"\ntest -f \"$BUNDLE\" || { echo\
+          \ \"FATAL: missing $BUNDLE\"; exit 1; }\ntest -f GroundingDINO/groundingdino_swinb_cogcoor.pth || { echo \"FATAL: missing Grounding DINO checkpoint\"; exit 1; }\necho \"CUB test images: $(find -L datasets/CUB/test -name '*.jpg' | wc -l)\"\n\necho \"===== 2. test run: 16 images =====\"\npython -m scripts.annotate_concepts --dataset cub_val --bundle \"$BUNDLE\" --output_dir \"$OUT_DIR\" --limit 16\npython - <<'PY'\nimport glob, json, os\nfiles = sorted(glob.glob(os.path.join(os.environ[\"OUT_DIR\"], \"cub_val\", \"*.json\")))\nn_boxes = [len(json.load(open(f))) - 1 for f in files]\nprint(f\"  {len(files)} files, detections per image: {n_boxes}\")\nassert len(files) >= 16 and sum(n_boxes) > 0, \"test run produced no detections\"\nprint(\"  example:\", [(a[\"label\"], round(a[\"logit\"], 2)) for a in json.load(open(files[0]))[1:6]])\nPY\n\necho \"===== 3. full CUB test set =====\"\nstart=$(date +%s)\npython -m scripts.annotate_concepts --dataset cub_val --bundle \"$BUNDLE\" --output_dir\
+          \ \"$OUT_DIR\"\nn=$(ls \"$OUT_DIR/cub_val\" | grep -c '\\.json$')\necho \"annotated $n images in $(( ($(date +%s) - start) / 60 )) min\"\ntest \"$n\" -ge 5790 || { echo \"FATAL: only $n of 5790 images annotated\"; exit 1; }\n\necho \"===== 4. copy to /shared =====\"\ntar czf \"$SHARED_OUT.part\" \"$OUT_DIR\"\nmv \"$SHARED_OUT.part\" \"$SHARED_OUT\"\nls -la \"$SHARED_OUT\"\necho \"===== all done =====\"\n"
+        volumeMounts:
+        - name: ml-storage
+          mountPath: /workspace
+        - name: shared
+          mountPath: /shared
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            cpu: '4'
+            memory: 12Gi
+            ephemeral-storage: 10Gi
+            nvidia.com/gpu: '1'
+          limits:
+            cpu: '4'
+            memory: 12Gi
+            ephemeral-storage: 10Gi
+            nvidia.com/gpu: '1'
+      volumes:
+      - name: ml-storage
+        persistentVolumeClaim:
+          claimName: vlgcbm-workspace
+      - name: shared
+        persistentVolumeClaim:
+          claimName: ayush-shared
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                - us-west
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - v100-cc-star-01.noc.ucsb.edu
+                - nautilus-ext-gpu01.fullerton.edu
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-A10
+                - NVIDIA-RTX-A4000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-TITAN-RTX
+                - Quadro-RTX-6000
+                - NVIDIA-L4
+                - NVIDIA-L40
+                - NVIDIA-L40S
+                - NVIDIA-RTX-5000-Ada-Generation
+                - NVIDIA-RTX-4000-Ada-Generation

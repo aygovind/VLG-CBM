@@ -14,6 +14,7 @@ __pycache__/
 /annotations_merged/
 /paper_models/
 /paper_models_vlgcbm/
+/paper_bundles/
 /saved_models/
 # backbone feature cache written by train_standard.py
 /saved_activations/
