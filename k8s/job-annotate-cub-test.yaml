@@ -5,7 +5,8 @@
 # text_threshold 0.15), via scripts/annotate_concepts.py.
 #
 # Stages: preflight, a 16-image test run (stops if it finds nothing), the full 5,790
-# images (~40 min on a 16GB card; resumes after an eviction), then a tarball to
+# images (~40 min on a 16GB card, 60-90 min on an 11GB 2080 Ti; batch 4 fits
+# both; resumes after an eviction), then a tarball to
 # /shared/vlgcbm_eval_paper/ for local analysis.
 #
 # Submit:  kubectl apply -f k8s/job-annotate-cub-test.yaml
@@ -81,9 +82,54 @@ spec:
         - /bin/bash
         - -c
         args:
-        - "set -eo pipefail\nmkdir -p /workspace/logs\nLOGFILE=/workspace/logs/annotate-cub-test-$(date +%Y%m%d-%H%M%S).log\nexec > >(tee -a \"$LOGFILE\") 2>&1\necho \"mirroring this log to $LOGFILE\"\n\necho \"===== 1. preflight =====\"\nnvidia-smi --query-gpu=name,memory.total --format=csv\nsource /opt/conda/etc/profile.d/conda.sh\nconda activate /workspace/envs/vlgcbm\ncd /workspace/VLG-CBM\ngit fetch -q origin\n# files hand-copied onto the volume before they were committed block the fast-forward\nfor f in $(git diff --name-only --diff-filter=A HEAD \"$CODE_REF\"); do\n  if [ -f \"$f\" ] && ! git ls-files --error-unmatch \"$f\" >/dev/null 2>&1; then\n    echo \"setting aside untracked $f\"; mv \"$f\" \"/workspace/logs/$(basename \"$f\").untracked-$(date +%Y%m%d-%H%M%S)\"\n  fi\ndone\ngit merge --ff-only \"$CODE_REF\" || { echo \"FATAL: checkout cannot fast-forward to $CODE_REF\"; git status --short; exit 1; }\necho \"code: $(git rev-parse --short HEAD)\"\ntest -f \"$BUNDLE\" || { echo\
-          \ \"FATAL: missing $BUNDLE\"; exit 1; }\ntest -f GroundingDINO/groundingdino_swinb_cogcoor.pth || { echo \"FATAL: missing Grounding DINO checkpoint\"; exit 1; }\necho \"CUB test images: $(find -L datasets/CUB/test -name '*.jpg' | wc -l)\"\n\necho \"===== 2. test run: 16 images =====\"\npython -m scripts.annotate_concepts --dataset cub_val --bundle \"$BUNDLE\" --output_dir \"$OUT_DIR\" --limit 16\npython - <<'PY'\nimport glob, json, os\nfiles = sorted(glob.glob(os.path.join(os.environ[\"OUT_DIR\"], \"cub_val\", \"*.json\")))\nn_boxes = [len(json.load(open(f))) - 1 for f in files]\nprint(f\"  {len(files)} files, detections per image: {n_boxes}\")\nassert len(files) >= 16 and sum(n_boxes) > 0, \"test run produced no detections\"\nprint(\"  example:\", [(a[\"label\"], round(a[\"logit\"], 2)) for a in json.load(open(files[0]))[1:6]])\nPY\n\necho \"===== 3. full CUB test set =====\"\nstart=$(date +%s)\npython -m scripts.annotate_concepts --dataset cub_val --bundle \"$BUNDLE\" --output_dir\
-          \ \"$OUT_DIR\"\nn=$(ls \"$OUT_DIR/cub_val\" | grep -c '\\.json$')\necho \"annotated $n images in $(( ($(date +%s) - start) / 60 )) min\"\ntest \"$n\" -ge 5790 || { echo \"FATAL: only $n of 5790 images annotated\"; exit 1; }\n\necho \"===== 4. copy to /shared =====\"\ntar czf \"$SHARED_OUT.part\" \"$OUT_DIR\"\nmv \"$SHARED_OUT.part\" \"$SHARED_OUT\"\nls -la \"$SHARED_OUT\"\necho \"===== all done =====\"\n"
+        - |
+          set -eo pipefail
+          mkdir -p /workspace/logs
+          LOGFILE=/workspace/logs/annotate-cub-test-$(date +%Y%m%d-%H%M%S).log
+          exec > >(tee -a "$LOGFILE") 2>&1
+          echo "mirroring this log to $LOGFILE"
+
+          echo "===== 1. preflight ====="
+          nvidia-smi --query-gpu=name,memory.total --format=csv
+          source /opt/conda/etc/profile.d/conda.sh
+          conda activate /workspace/envs/vlgcbm
+          cd /workspace/VLG-CBM
+          git fetch -q origin
+          # files hand-copied onto the volume before they were committed block the fast-forward
+          for f in $(git diff --name-only --diff-filter=A HEAD "$CODE_REF"); do
+            if [ -f "$f" ] && ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "setting aside untracked $f"; mv "$f" "/workspace/logs/$(basename "$f").untracked-$(date +%Y%m%d-%H%M%S)"
+            fi
+          done
+          git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+          echo "code: $(git rev-parse --short HEAD)"
+          test -f "$BUNDLE" || { echo "FATAL: missing $BUNDLE"; exit 1; }
+          test -f GroundingDINO/groundingdino_swinb_cogcoor.pth || { echo "FATAL: missing Grounding DINO checkpoint"; exit 1; }
+          echo "CUB test images: $(find -L datasets/CUB/test -name '*.jpg' | wc -l)"
+
+          echo "===== 2. test run: 16 images ====="
+          python -m scripts.annotate_concepts --dataset cub_val --bundle "$BUNDLE" --output_dir "$OUT_DIR" --limit 16 --batch_size 4
+          python - <<'PY'
+          import glob, json, os
+          files = sorted(glob.glob(os.path.join(os.environ["OUT_DIR"], "cub_val", "*.json")))
+          n_boxes = [len(json.load(open(f))) - 1 for f in files]
+          print(f"  {len(files)} files, detections per image: {n_boxes}")
+          assert len(files) >= 16 and sum(n_boxes) > 0, "test run produced no detections"
+          print("  example:", [(a["label"], round(a["logit"], 2)) for a in json.load(open(files[0]))[1:6]])
+          PY
+
+          echo "===== 3. full CUB test set ====="
+          start=$(date +%s)
+          python -m scripts.annotate_concepts --dataset cub_val --bundle "$BUNDLE" --output_dir "$OUT_DIR" --batch_size 4
+          n=$(ls "$OUT_DIR/cub_val" | grep -c '\.json$')
+          echo "annotated $n images in $(( ($(date +%s) - start) / 60 )) min"
+          test "$n" -ge 5790 || { echo "FATAL: only $n of 5790 images annotated"; exit 1; }
+
+          echo "===== 4. copy to /shared ====="
+          tar czf "$SHARED_OUT.part" "$OUT_DIR"
+          mv "$SHARED_OUT.part" "$SHARED_OUT"
+          ls -la "$SHARED_OUT"
+          echo "===== all done ====="
         volumeMounts:
         - name: ml-storage
           mountPath: /workspace
@@ -130,6 +176,8 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
+                - NVIDIA-GeForce-RTX-2080-Ti
+                - NVIDIA-GeForce-RTX-3080
                 - NVIDIA-GeForce-RTX-3090
                 - NVIDIA-GeForce-RTX-4090
                 - NVIDIA-A10
