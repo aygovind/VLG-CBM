@@ -16,7 +16,7 @@ Two outputs per run:
                             class names, W_g and b_g, so it can be analysed on a laptop
                             with nothing but torch -- no repo, no PVC, no model weights
 
-Bundle contents (N = 2625 test images, C = concepts, K = 525 classes):
+Bundle contents (N = test images, e.g. 2625 for birds525; C = concepts; K = classes):
   preds         [N]     int64    predicted class index
   labels        [N]     int64    ground-truth class index
   correct       [N]     bool
@@ -26,6 +26,9 @@ Bundle contents (N = 2625 test images, C = concepts, K = 525 classes):
   b_g           [K]     float32
   concepts      list[str], length C
   classes       list[str], length K
+  concept_mean  [C]     float32  concept_acts * concept_std + concept_mean is the raw
+  concept_std   [C]     float32  concept layer output, before standardisation
+  image_paths   list[str] | None  eval image files in dataset order (None for CIFAR)
   meta          dict: run_dir, accuracy, metrics.txt accuracy, train args
 
 Per-concept contribution to class k for image i is concept_acts[i] * W_g[k] -- the
@@ -108,6 +111,10 @@ def process(load_dir, save_dir, out_dir, device, batch_size, num_workers, force)
 
     acc = res.accuracy
     ref = reference_accuracy(load_dir)
+    # the eval split's file paths, in dataset order, so an index can be traced back to
+    # its image -- and, for CUB, to the image's attribute labels. None for CIFAR.
+    eval_data = va.get_data(run, "val", raw=True)
+    image_paths = [p for p, _ in eval_data.samples] if hasattr(eval_data, "samples") else None
 
     bundle = {
         "preds": res.preds.long(),
@@ -119,10 +126,15 @@ def process(load_dir, save_dir, out_dir, device, batch_size, num_workers, force)
         "b_g": b_g,
         "concepts": list(run.concepts),
         "classes": list(run.classes),
+        # concept_acts are standardised; concept_acts * std + mean is the raw concept
+        # layer output, which is what a threshold for "the concept fired" applies to
+        "concept_mean": run.model.normalization.mean.detach().float().cpu(),
+        "concept_std": run.model.normalization.std.detach().float().cpu(),
+        "image_paths": image_paths,
         "meta": {
             "name": name,
             "run_dir": os.path.abspath(load_dir),
-            "split": "birds525_val (held-out test set, 5 images/class)",
+            "split": "{}_val (the held-out test set)".format(run.dataset),
             "accuracy": acc,
             "metrics_txt_accuracy": ref,
             "logit_reconstruction_max_err": max_err,

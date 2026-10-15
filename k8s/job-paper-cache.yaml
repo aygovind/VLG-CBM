@@ -1,0 +1,197 @@
+# Result caches for the VLG-CBM paper's released models on CUB, CIFAR-10 and CIFAR-100,
+# for the concept-faithfulness analysis (concept_faithfulness.md). No training: this
+# downloads the paper's checkpoints and the datasets, runs each model once over its
+# test set, and writes self-contained bundles (predictions, concept activations,
+# final-layer weights, image paths) to /shared/vlgcbm_eval_paper -- readable from any
+# pod, so the analysis itself needs neither a GPU nor this volume.
+#
+# CPU only: the test sets are 5,790 (CUB) and 10,000 (each CIFAR) images through a
+# ResNet-18 / CLIP RN50, a few minutes each on 8 cores, and GPUs are often unavailable.
+#
+# Stages, each skipped if already done:
+#   1. preflight     code at the pushed commit
+#   2. checkpoints   the paper's saved_models.zip via scripts/download_models.sh's Drive
+#                    link -> paper_models/. Stops the job if the link is dead; the README's
+#                    SharePoint folder is then the only source and needs a browser.
+#   3. CUB           CUB_200_2011 -> datasets/CUB/{train,test}, plus datasets/CUB_meta/
+#                    with the per-image attribute labels the split script would delete
+#   4. CIFAR         torchvision downloads of the two test sets
+#   5. bundles       scripts/generate_eval.py on the cub / cifar runs
+#
+# Est. ~35-60 min, most of it downloads.
+#
+# Submit:  kubectl apply -f k8s/job-paper-cache.yaml
+# Watch:   kubectl logs -f job/vlgcbm-paper-cache | grep -E "=====|acc|FATAL|Traceback"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-paper-cache
+  labels:
+    app: vlgcbm
+    run: paper-cache
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 21600     # 6h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: paper-cache
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        # the CephFS CSI driver ignores fsGroup; without this the job cannot write to
+        # /shared. Idempotent.
+        - name: fix-shared-perms
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+          securityContext: {runAsUser: 0, runAsGroup: 0}
+          volumeMounts: [{name: shared, mountPath: /shared}]
+          resources:
+            requests: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+            limits: {cpu: "100m", memory: "256Mi", ephemeral-storage: "1Gi"}
+      containers:
+        - name: cache
+          image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+          env:
+            - {name: HF_HOME, value: /workspace/.cache/huggingface}
+            - {name: TORCH_HOME, value: /workspace/.cache/torch}
+            - {name: PIP_CACHE_DIR, value: /workspace/.cache/pip}
+            - {name: DATASET_FOLDER, value: /workspace/VLG-CBM/datasets}
+            - {name: CODE_REF, value: "origin/bioclip-birds525"}
+            - {name: PAPER_DIR, value: "paper_models"}
+            - {name: OUT, value: "/shared/vlgcbm_eval_paper"}
+            # from scripts/download_models.sh
+            - {name: CKPT_DRIVE_ID, value: "1fOUVzBpEt75s5IzY1HqcXiu6x9a830u7"}
+            - {name: CUB_URL, value: "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz"}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -eo pipefail
+              mkdir -p /workspace/logs
+              LOGFILE=/workspace/logs/paper-cache-$(date +%Y%m%d-%H%M%S).log
+              exec > >(tee -a "$LOGFILE") 2>&1
+              echo "mirroring this log to $LOGFILE"
+
+              echo "===== 1. preflight ====="
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate /workspace/envs/vlgcbm
+              cd /workspace/VLG-CBM
+              git fetch -q origin
+              # files hand-copied onto the volume before they were committed block the
+              # fast-forward as untracked files; set those aside instead of deleting them
+              for f in $(git diff --name-only --diff-filter=A HEAD "$CODE_REF"); do
+                if [ -f "$f" ] && ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                  echo "setting aside untracked $f"
+                  mv "$f" "/workspace/logs/$(basename "$f").untracked-$(date +%Y%m%d-%H%M%S)"
+                fi
+              done
+              git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+              echo "code: $(git rev-parse --short HEAD)"
+              df -h /workspace | tail -1
+              nproc
+
+              echo "===== 2. paper checkpoints ====="
+              if [ -n "$(find "$PAPER_DIR" -name cbl.pt 2>/dev/null | head -1)" ]; then
+                echo "$PAPER_DIR already unpacked, skipping"
+              else
+                export PYTHONPATH=/workspace/tools_pkgs
+                python -c "import gdown" 2>/dev/null || pip install -q --target /workspace/tools_pkgs gdown
+                rm -f paper_models.zip.part
+                if ! python -m gdown "$CKPT_DRIVE_ID" -O paper_models.zip.part; then
+                  echo "FATAL: the Google Drive link in scripts/download_models.sh no longer serves the checkpoints."
+                  echo "       Download saved_models from the SharePoint folder in README.md and put it at"
+                  echo "       /workspace/VLG-CBM/$PAPER_DIR, then resubmit; this stage will be skipped."
+                  exit 1
+                fi
+                unset PYTHONPATH
+                ls -la paper_models.zip.part
+                mkdir -p "$PAPER_DIR"
+                python -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" paper_models.zip.part "$PAPER_DIR"
+                rm paper_models.zip.part
+              fi
+              du -sh "$PAPER_DIR"
+              echo "run directories:"
+              find "$PAPER_DIR" -name cbl.pt -printf '  %h\n' | sort
+
+              echo "===== 3. CUB ====="
+              if [ "$(find -L datasets/CUB/test -name '*.jpg' 2>/dev/null | wc -l)" -ge 5790 ] && [ -f datasets/CUB_meta/attributes/image_attribute_labels.txt ]; then
+                echo "CUB already prepared, skipping"
+              else
+                cd datasets
+                rm -rf CUB CUB_200_2011 attributes.txt CUB_200_2011.tgz.part
+                wget -nv -O CUB_200_2011.tgz.part "$CUB_URL"
+                tar xf CUB_200_2011.tgz.part
+                rm CUB_200_2011.tgz.part
+                # the split script deletes CUB_200_2011 afterwards in download_cub.sh; keep
+                # the per-image attribute labels the faithfulness analysis is built on
+                mkdir -p CUB_meta
+                cp -r CUB_200_2011/attributes CUB_meta/
+                cp CUB_200_2011/images.txt CUB_200_2011/train_test_split.txt CUB_200_2011/classes.txt \
+                   CUB_200_2011/image_class_labels.txt CUB_meta/
+                [ -f attributes.txt ] && cp attributes.txt CUB_meta/
+                python split_cub_dataset.py
+                rm -rf CUB_200_2011 attributes.txt
+                cd ..
+              fi
+              echo "CUB test images: $(find -L datasets/CUB/test -name '*.jpg' | wc -l)"
+              ls datasets/CUB_meta datasets/CUB_meta/attributes
+
+              echo "===== 4. CIFAR ====="
+              python - <<'PY'
+              import data.utils as du
+              for name in ("cifar10_val", "cifar100_val"):
+                  print(f"  {name}: {len(du.get_data(name))} images")
+              PY
+
+              echo "===== 5. bundles ====="
+              names=$(python - <<'PY'
+              import os, re, vlgcbm_analysis as va
+              root = os.environ["PAPER_DIR"]
+              # the zip may nest the runs one level down, e.g. paper_models/saved_models/
+              for base in [root] + [os.path.join(root, d) for d in sorted(os.listdir(root))]:
+                  runs = va.find_runs(base) if os.path.isdir(base) else []
+                  if runs:
+                      break
+              names = [os.path.relpath(r, base).split(os.sep)[0] for r in runs]
+              print(base)
+              print(" ".join(n for n in names if re.search(r"cub|cifar", n, re.I)))
+              PY
+              )
+              base=$(echo "$names" | head -1); only=$(echo "$names" | tail -1)
+              echo "runs under $base: $only"
+              test -n "$only" || { echo "FATAL: no cub/cifar run found under $PAPER_DIR"; exit 1; }
+              mkdir -p "$OUT"
+              python -W ignore scripts/generate_eval.py --save_dir "$base" --out "$OUT" \
+                --device cpu --num_workers 6 --only $only
+              ls -la "$OUT"
+              echo "===== all done ====="
+          volumeMounts:
+            - {name: ml-storage, mountPath: /workspace}
+            - {name: shared, mountPath: /shared}
+            - {name: dshm, mountPath: /dev/shm}
+          resources:
+            requests: {cpu: "8", memory: "16Gi", ephemeral-storage: "10Gi"}
+            limits: {cpu: "8", memory: "16Gi", ephemeral-storage: "10Gi"}
+      volumes:
+        - name: ml-storage
+          persistentVolumeClaim: {claimName: vlgcbm-workspace}
+        - name: shared
+          persistentVolumeClaim: {claimName: ayush-shared}
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}   # counts against the 16Gi limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # vlgcbm-workspace lives in the us-west ceph pool
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values: ["us-west"]

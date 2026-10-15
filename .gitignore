@@ -12,6 +12,7 @@ __pycache__/
 /annotations_smoke/
 /annotations_sae/
 /annotations_merged/
+/paper_models/
 /saved_models/
 # backbone feature cache written by train_standard.py
 /saved_activations/
