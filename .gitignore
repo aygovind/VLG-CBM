@@ -12,6 +12,7 @@ __pycache__/
 /annotations_smoke/
 /annotations_sae/
 /annotations_merged/
+/annotations_cub_decision/
 /paper_models/
 /paper_models_vlgcbm/
 /paper_bundles/

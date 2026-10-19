@@ -1,0 +1,146 @@
+# Patch-token SAE on Birds-525 with ViT-B/16 (196 tokens per image): the Kaggle notebook
+# sae-concept-set-generation-patch-trial, sections 1-3, via scripts/train_patch_sae.py.
+#
+# Stages (each skipped or resumed when its output exists; resubmit after an eviction):
+#   1. preflight   code, packages, >= 40 GB free on /shared
+#   2. dataset     cleaned Birds-525 -> /shared/data/birds525 (scripts/prepare_birds525.py:
+#                  Looney Birds removed, PARAKETT AUKLET merged; 524 classes)    ~10-15 min
+#   3. SAE         cache (~27 GB fp16)  ~15-30 min; training <= 100 epochs, patience 10,
+#                  ~1-2 min/epoch; metrics, top-latent figures, export          ~1-3 h
+#
+# Outputs in /shared/sae_patch16:
+#   training_curves.png, training_history.json, metrics.json, firing_density.png,
+#   top_latents/*.png, birds525_patch_sae_{best,last,bundle}.pt, naming_data.pt,
+#   results/{test_results.pt, test_patches.npy}   <- pull these for CPU-only analysis
+#
+# Submit:  kubectl apply -f k8s/job-sae-patch16.yaml
+# Watch:   kubectl logs -f job/sae-patch16-birds525 | grep -E "=====|epoch|img/s|FATAL|Traceback|done"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sae-patch16-birds525
+  labels:
+    app: vlgcbm
+    run: sae-patch16
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 43200     # 12h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: sae-patch16
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+      - name: fix-shared-perms
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+        securityContext: {runAsUser: 0, runAsGroup: 0}
+        volumeMounts: [{name: shared, mountPath: /shared}]
+        resources:
+          requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi}
+          limits: {cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi}
+      containers:
+      - name: sae
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        env:
+        - {name: HF_HOME, value: /workspace/.cache/huggingface}
+        - {name: TORCH_HOME, value: /workspace/.cache/torch}
+        - {name: PIP_CACHE_DIR, value: /workspace/.cache/pip}
+        - {name: CODE_REF, value: origin/bioclip-birds525}
+        - {name: DATA, value: /shared/data/birds525}
+        - {name: RUN_DIR, value: /shared/sae_patch16}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eo pipefail
+          mkdir -p /workspace/logs
+          LOGFILE=/workspace/logs/sae-patch16-$(date +%Y%m%d-%H%M%S).log
+          exec > >(tee -a "$LOGFILE") 2>&1
+          echo "mirroring this log to $LOGFILE"
+
+          echo "===== 1. preflight ====="
+          nvidia-smi --query-gpu=name,memory.total --format=csv
+          source /opt/conda/etc/profile.d/conda.sh
+          conda activate /workspace/envs/vlgcbm
+          cd /workspace/VLG-CBM
+          git fetch -q origin
+          # files hand-copied onto the volume before they were committed block the fast-forward
+          for f in $(git diff --name-only --diff-filter=A HEAD "$CODE_REF"); do
+            if [ -f "$f" ] && ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "setting aside untracked $f"; mv "$f" "/workspace/logs/$(basename "$f").untracked-$(date +%Y%m%d-%H%M%S)"
+            fi
+          done
+          git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+          echo "code: $(git rev-parse --short HEAD)"
+          export PYTHONPATH=/workspace/tools_pkgs
+          python -c "import pyarrow" 2>/dev/null || pip install -q --no-deps --target /workspace/tools_pkgs pyarrow
+          python -c "import pyarrow, huggingface_hub, torch, torchvision, matplotlib; print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'pyarrow', pyarrow.__version__)"
+          mkdir -p /shared/data "$RUN_DIR"
+          free_gb=$(df -BG --output=avail /shared | tail -1 | tr -dc 0-9)
+          echo "/shared free: ${free_gb} GB"
+          need=40; [ -f "$RUN_DIR/cache/train_cache.json" ] && need=5
+          [ "$free_gb" -ge "$need" ] || { echo "FATAL: need ${need} GB free on /shared, have ${free_gb}"; exit 1; }
+          free -g | head -2
+
+          echo "===== 2. dataset ====="
+          python scripts/prepare_birds525.py --out "$DATA"
+          cat "$DATA/manifest.json"
+
+          echo "===== 3. SAE ====="
+          python -u -W ignore::UserWarning scripts/train_patch_sae.py --data "$DATA" --run_dir "$RUN_DIR" \
+            --patch_size 16 --epochs 100 --patience 10 --workers 6
+          ls -la "$RUN_DIR" "$RUN_DIR/results" "$RUN_DIR/top_latents"
+          echo "===== all done ====="
+        volumeMounts:
+        - {name: ml-storage, mountPath: /workspace}
+        - {name: shared, mountPath: /shared}
+        - {name: dshm, mountPath: /dev/shm}
+        resources:
+          requests: {cpu: "8", memory: 48Gi, ephemeral-storage: 10Gi, nvidia.com/gpu: "1"}
+          limits: {cpu: "8", memory: 48Gi, ephemeral-storage: 10Gi, nvidia.com/gpu: "1"}
+      volumes:
+      - name: ml-storage
+        persistentVolumeClaim: {claimName: vlgcbm-workspace}
+      - name: shared
+        persistentVolumeClaim: {claimName: ayush-shared}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 2Gi}   # counts against the memory limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              # vlgcbm-workspace lives in the us-west ceph pool
+              - key: topology.kubernetes.io/region
+                operator: In
+                values: [us-west]
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: [v100-cc-star-01.noc.ucsb.edu, nautilus-ext-gpu01.fullerton.edu]
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-GeForce-RTX-2080-Ti
+                - NVIDIA-GeForce-RTX-3080
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-A10
+                - NVIDIA-RTX-A4000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-RTX-A6000
+                - NVIDIA-TITAN-RTX
+                - Quadro-RTX-6000
+                - NVIDIA-L4
+                - NVIDIA-L40
+                - NVIDIA-L40S
+                - NVIDIA-A40
+                - NVIDIA-RTX-5000-Ada-Generation
+                - NVIDIA-RTX-4000-Ada-Generation
