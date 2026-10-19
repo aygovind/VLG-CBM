@@ -412,8 +412,8 @@ def main():
     else:
         tot = torch.zeros(D, dtype=torch.float64, device=device)
         sq = torch.zeros_like(tot)
-        for s in range(0, len(train_tokens), 1 << 20):
-            x = train_tokens[s:s + (1 << 20)].to(device).double()
+        for s in range(0, len(train_tokens), 1 << 17):  # 131k tokens: 0.8 GB per float64 buffer
+            x = train_tokens[s:s + (1 << 17)].to(device).double()
             tot += x.sum(0); sq += x.square().sum(0)
         m64 = tot / len(train_tokens)
         mean = m64.float().cpu()
