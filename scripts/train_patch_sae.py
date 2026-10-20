@@ -251,6 +251,8 @@ def latent_stats(sae, patches_mm, mean, scale, device, chunk_images=256):
     """Per image max activation over patches [N, L], plus token-level metrics."""
     n, p, d = patches_mm.shape
     firing = torch.zeros(sae.latent_dim, dtype=torch.float64, device=device)
+    sum_x = torch.zeros(d, dtype=torch.float64, device=device)
+    sum_x2 = torch.zeros_like(sum_x)
     sq_err = l1 = active = 0.0
     maxes = []
     for s in range(0, n, chunk_images):
@@ -262,9 +264,20 @@ def latent_stats(sae, patches_mm, mean, scale, device, chunk_images=256):
         active += (z > 0).sum().item()
         firing += (z > 0).sum(dim=(0, 1)).double()
         maxes.append(z.amax(dim=1).cpu())
+        flat = x.reshape(-1, d).double()
+        sum_x += flat.sum(0); sum_x2 += flat.square().sum(0)
     tokens = n * p
     density = (firing / tokens).cpu().numpy()
-    metrics = {"mse": sq_err / (tokens * d), "l1": l1 / tokens, "l0": active / tokens,
+    mse = sq_err / (tokens * d)
+    var = (sum_x2 / tokens - (sum_x / tokens).square()).mean().clamp_min(1e-12).item()
+    edges = [0, 0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 1.0]
+    hist = np.r_[(density == 0).sum(), np.histogram(density[density > 0], bins=edges)[0]]
+    metrics = {"mse": mse, "explained_variance": 1 - mse / var, "l1": l1 / tokens, "l0": active / tokens,
+               "l0_pct": active / tokens / sae.latent_dim,
+               "dead_pct": float((density == 0).mean()),
+               "density_hist": {k: int(v) for k, v in zip(
+                   ["dead", "(0-0.1%)", "[0.1-1%)", "[1-5%)", "[5-10%)", "[10-25%)", "[25-50%)", "[50-100%]"], hist)},
+               "density_percentiles": {f"p{q}": float(np.percentile(density, q)) for q in (1, 10, 25, 50, 75, 90, 99)},
                "density_mean": float(density.mean()), "density_std": float(density.std()),
                "density_min": float(density.min()), "density_max": float(density.max()),
                "dead": int((density == 0).sum()), "firing_lt_1pct": int((density < 0.01).sum()),
