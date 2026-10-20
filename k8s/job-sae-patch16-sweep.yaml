@@ -1,6 +1,6 @@
 # L1 sweep for the patch-16 SAE (scripts/sweep_patch_sae.py): find a sparser SAE (target L0 < 5%).
 # Reuses /shared/sae_patch16's token caches and normalisation; one SAE per L1 coefficient
-# (1e-3 retrained for 20 epochs for a like-for-like comparison), 20 epochs, patience 5.
+# (first pass: 1e-3, 3e-3, 1e-2, 3e-2, 1e-1; second pass fills the gap: 1.5e-3, 2e-3, 5e-3), 20 epochs, patience 5.
 # Everything else as the first run. Resumable: resubmit after an eviction, finished runs
 # are skipped.
 #
@@ -88,7 +88,7 @@ spec:
 
           echo "===== 2. sweep ====="
           python -u -W ignore::UserWarning -m scripts.sweep_patch_sae --data "$DATA" --source_run "$SOURCE_RUN" \
-            --out "$OUT" --l1 1e-3 3e-3 1e-2 3e-2 1e-1 --epochs 20 --patience 5
+            --out "$OUT" --l1 1.5e-3 2e-3 5e-3 --epochs 20 --patience 5
           ls -la "$OUT"
           echo "===== all done ====="
         volumeMounts:

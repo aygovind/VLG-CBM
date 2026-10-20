@@ -39,6 +39,12 @@ from scripts.train_patch_sae import (ReLUSAE, crop_224, latent_figure, latent_st
                                      run_epoch)
 
 
+def run_name(coeff):
+    """l1_1e-03, l1_3e-03, ...; one decimal when needed (l1_1.5e-03), so names never collide."""
+    short = f"{coeff:.0e}"
+    return f"l1_{short}" if float(short) == coeff else f"l1_{coeff:.1e}"
+
+
 def train_one(sae, train_tokens, val_tokens, mean_d, scale_d, run, cfg, base_payload, device):
     """Train (or resume) one SAE; returns its history. Same early stopping as train_patch_sae."""
     best_path = os.path.join(run, "birds525_patch_sae_best.pt")
@@ -256,7 +262,7 @@ def main():
                     "dataset": ref["dataset"], "dataset_revision": ref["dataset_revision"], "dataset_path": args.data}
 
     for coeff in args.l1:
-        name = f"l1_{coeff:.0e}"
+        name = run_name(coeff)
         run = os.path.join(args.out, name)
         os.makedirs(run, exist_ok=True)
         if os.path.exists(os.path.join(run, "metrics.json")) and name in entries:
