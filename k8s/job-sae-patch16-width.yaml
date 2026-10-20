@@ -1,0 +1,139 @@
+# Width sweep for the patch-16 SAE (scripts/sweep_patch_sae.py --widths): more latents at a
+# fixed L1 of 3e-3. Expansion 4x, 8x, 16x (3,072 / 6,144 / 12,288 latents), then 2x rerun on the
+# same recipe. Up to 100 epochs, patience 10, min_delta 1e-4; everything else as the L1 sweep
+# (same caches, normalisation, LR, batch, seed). Resumable; finished runs are skipped.
+# To train a stopped run further: raise --epochs and add --extend (resets the patience counter).
+#
+# Rough time: 1.5 / 2.5 / 4 / 1 min per epoch for 4x / 8x / 16x / 2x; early stopping decides.
+# Outputs: /shared/sae_patch16_width/{w*x_l1_3e-03/, sweep_summary.json, width_comparison.png,
+#          sweep_frontier.png, random_latent_collages/}
+#
+# Submit:  kubectl apply -f k8s/job-sae-patch16-width.yaml
+# Watch:   kubectl logs -f job/sae-patch16-width -c sae | grep -E "=====|epoch|best epoch|FATAL|Traceback"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sae-patch16-width
+  labels:
+    app: vlgcbm
+    run: sae-patch16-width
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 86400     # 24h
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: vlgcbm
+        run: sae-patch16-width
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 100
+        fsGroup: 100
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+      - name: fix-shared-perms
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        command: ["/bin/bash", "-c", "chown 1000:100 /shared && chmod 0775 /shared"]
+        securityContext: {runAsUser: 0, runAsGroup: 0}
+        volumeMounts: [{name: shared, mountPath: /shared}]
+        resources:
+          requests: {cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi}
+          limits: {cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi}
+      containers:
+      - name: sae
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        env:
+        - {name: HF_HOME, value: /workspace/.cache/huggingface}
+        - {name: TORCH_HOME, value: /workspace/.cache/torch}
+        - {name: PIP_CACHE_DIR, value: /workspace/.cache/pip}
+        - {name: CODE_REF, value: origin/bioclip-birds525}
+        - {name: DATA, value: /shared/data/birds525}
+        - {name: SOURCE_RUN, value: /shared/sae_patch16}
+        - {name: OUT, value: /shared/sae_patch16_width}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eo pipefail
+          mkdir -p /workspace/logs
+          LOGFILE=/workspace/logs/sae-patch16-width-$(date +%Y%m%d-%H%M%S).log
+          exec > >(tee -a "$LOGFILE") 2>&1
+          echo "mirroring this log to $LOGFILE"
+
+          echo "===== 1. preflight ====="
+          nvidia-smi --query-gpu=name,memory.total --format=csv
+          source /opt/conda/etc/profile.d/conda.sh
+          conda activate /workspace/envs/vlgcbm
+          cd /workspace/VLG-CBM
+          git fetch -q origin
+          # files hand-copied onto the volume before they were committed block the fast-forward
+          for f in $(git diff --name-only --diff-filter=A HEAD "$CODE_REF"); do
+            if [ -f "$f" ] && ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "setting aside untracked $f"; mv "$f" "/workspace/logs/$(basename "$f").untracked-$(date +%Y%m%d-%H%M%S)"
+            fi
+          done
+          git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+          echo "code: $(git rev-parse --short HEAD)"
+          export PYTHONPATH=/workspace/tools_pkgs
+          python -c "import pyarrow" 2>/dev/null || pip install -q --no-deps --target /workspace/tools_pkgs pyarrow
+          python -c "import pyarrow, huggingface_hub, torch, torchvision, matplotlib; print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'pyarrow', pyarrow.__version__)"
+          free_gb=$(df -BG --output=avail /shared | tail -1 | tr -dc 0-9)
+          echo "/shared free: ${free_gb} GB"
+          [ "$free_gb" -ge 5 ] || { echo "FATAL: need 5 GB free on /shared, have ${free_gb}"; exit 1; }
+          for f in birds525_patch_sae_best.pt cache/train_cache.json cache/test_cache.json results/test_patches.npy; do
+            test -f "$SOURCE_RUN/$f" || { echo "FATAL: missing $SOURCE_RUN/$f"; exit 1; }
+          done
+          free -g | head -2
+
+          echo "===== 2. width sweep ====="
+          python -u -W ignore::UserWarning -m scripts.sweep_patch_sae --data "$DATA" --source_run "$SOURCE_RUN" \
+            --out "$OUT" --l1 3e-3 --widths 4 8 16 2 --epochs 100 --patience 10 --min_delta 1e-4
+          ls -la "$OUT"
+          echo "===== all done ====="
+        volumeMounts:
+        - {name: ml-storage, mountPath: /workspace}
+        - {name: shared, mountPath: /shared}
+        - {name: dshm, mountPath: /dev/shm}
+        resources:
+          requests: {cpu: "8", memory: 48Gi, ephemeral-storage: 10Gi, nvidia.com/gpu: "1"}
+          limits: {cpu: "8", memory: 48Gi, ephemeral-storage: 10Gi, nvidia.com/gpu: "1"}
+      volumes:
+      - name: ml-storage
+        persistentVolumeClaim: {claimName: vlgcbm-workspace}
+      - name: shared
+        persistentVolumeClaim: {claimName: ayush-shared}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 2Gi}   # counts against the memory limit
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              # vlgcbm-workspace lives in the us-west ceph pool
+              - key: topology.kubernetes.io/region
+                operator: In
+                values: [us-west]
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values: [v100-cc-star-01.noc.ucsb.edu, nautilus-ext-gpu01.fullerton.edu]
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-GeForce-RTX-2080-Ti
+                - NVIDIA-GeForce-RTX-3080
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-A10
+                - NVIDIA-RTX-A4000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-RTX-A6000
+                - NVIDIA-TITAN-RTX
+                - Quadro-RTX-6000
+                - NVIDIA-L4
+                - NVIDIA-L40
+                - NVIDIA-L40S
+                - NVIDIA-A40
+                - NVIDIA-RTX-5000-Ada-Generation
+                - NVIDIA-RTX-4000-Ada-Generation

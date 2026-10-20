@@ -45,8 +45,9 @@ def run_name(coeff):
     return f"l1_{short}" if float(short) == coeff else f"l1_{coeff:.1e}"
 
 
-def train_one(sae, train_tokens, val_tokens, mean_d, scale_d, run, cfg, base_payload, device):
-    """Train (or resume) one SAE; returns its history. Same early stopping as train_patch_sae."""
+def train_one(sae, train_tokens, val_tokens, mean_d, scale_d, run, cfg, base_payload, device, extend=False):
+    """Train (or resume) one SAE; returns its history. Same early stopping as train_patch_sae.
+    extend: reopen an early-stopped run for more epochs (resets the patience counter)."""
     best_path = os.path.join(run, "birds525_patch_sae_best.pt")
     last_path = os.path.join(run, "birds525_patch_sae_last.pt")
     optimizer = torch.optim.Adam(sae.parameters(), lr=cfg.lr)
@@ -55,10 +56,14 @@ def train_one(sae, train_tokens, val_tokens, mean_d, scale_d, run, cfg, base_pay
     if os.path.exists(last_path):
         last = torch.load(last_path, map_location="cpu", weights_only=True)
         assert last["config"]["l1_coeff"] == cfg.l1_coeff, f"{run} holds another L1 coefficient"
+        assert last["latent_dim"] == sae.latent_dim, f"{run} holds another width"
         sae.load_state_dict(last["state_dict"]); optimizer.load_state_dict(last["optimizer_state"])
         generator.set_state(last["loader_generator_state"])
         history, best_loss, ref = last["history"], last["best_loss"], last["patience_reference"]
         stale, start = last["epochs_without_improvement"], last["epoch"] + 1
+        if extend and stale:
+            log(f"  extend: resetting patience ({stale} epochs without improvement)")
+            stale = 0
         log(f"  resuming at epoch {start}")
         del last
 
@@ -98,7 +103,8 @@ def evaluate_one(sae, mm, mean_d, scale_d, device, run, ctx, figures=True):
     sae.eval()
     scores, density, metrics = {}, {}, {}
     for s in ("validation", "test"):
-        scores[s], density[s], metrics[s] = latent_stats(sae, mm[s][0], mean_d, scale_d, device)
+        scores[s], density[s], metrics[s] = latent_stats(sae, mm[s][0], mean_d, scale_d, device,
+                                                         chunk_images=max(16, 256 * 1536 // sae.latent_dim))
     plot_density(density, os.path.join(run, "firing_density.png"))
     scan = {s: rank_latents(scores[s], ctx["cls"][s]) for s in ("validation", "test")}
     if figures:
@@ -148,13 +154,16 @@ def export_one(sae, best, run, scores, density, metrics, scan, history, ctx, mea
     }, os.path.join(res, "test_results.pt"))
 
 
-def summary_entry(name, coeff, epochs_trained, best_epoch, metrics):
-    keys = ("l0", "l0_pct", "l1", "mse", "explained_variance", "dead", "dead_pct",
+def summary_entry(name, coeff, epochs_trained, best_epoch, metrics, latent_dim=None):
+    keys = ("l0", "l0_pct", "l1", "mse", "explained_variance", "dead", "dead_pct", "firing_lt_1pct",
             "density_mean", "density_hist", "density_percentiles")
-    return {"name": name, "l1_coeff": coeff, "epochs_trained": epochs_trained, "best_epoch": best_epoch,
+    return {"name": name, "l1_coeff": coeff, "latent_dim": latent_dim,
+            "epochs_trained": epochs_trained, "best_epoch": best_epoch,
             **{s: {k: metrics[s][k] for k in keys} for s in ("validation", "test")},
             "notes": {"l0": "active latents per patch", "l1": "mean L1 norm of latents per patch",
-                      "mse": "L2 reconstruction error per dimension (normalised tokens)"}}
+                      "mse": "L2 reconstruction error per dimension (normalised tokens)",
+                      "firing_lt_1pct": "inactive: latents firing on < 1% of patches (dead included)",
+                      "density_mean": "mean firing rate over latents"}}
 
 
 def plot_frontier(entries, path):
@@ -164,12 +173,37 @@ def plot_frontier(entries, path):
         ref = e["name"].endswith("100ep")
         ax.scatter(v["l0"], v["explained_variance"], s=70, marker="s" if ref else "o",
                    color="gray" if ref else "tab:blue", zorder=3)
-        ax.annotate(f"{e['l1_coeff']:g}" + (" (100 ep)" if ref else ""), (v["l0"], v["explained_variance"]),
+        ax.annotate(e["name"].replace("l1_", ""), (v["l0"], v["explained_variance"]),
                     textcoords="offset points", xytext=(6, 6), fontsize=10)
     ax.set_xscale("log")
-    ax.axvline(0.05 * 1536, color="tab:red", ls="--", lw=1, label="L0 = 5% of latents")
+    ax.axvline(0.05 * 1536, color="tab:red", ls="--", lw=1, label="L0 = 5% of 1536 latents")
     ax.set_xlabel("L0: active latents per patch (log scale)"); ax.set_ylabel("Explained variance (validation)")
     ax.set_title("Sparsity vs reconstruction, one point per L1 coefficient"); ax.grid(alpha=.3); ax.legend()
+    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+
+
+def plot_width_comparison(entries, path):
+    """Bar charts across the width-sweep runs (names w<k>x_...): L0 %, EV, dead and inactive latents."""
+    runs = sorted([e for e in entries if e["name"].startswith("w")], key=lambda e: (e["latent_dim"], e["l1_coeff"]))
+    if not runs:
+        return
+    labels = [f"{e['name'].split('_')[0]}\n{e['latent_dim']:,}" for e in runs]
+    v = [e["validation"] for e in runs]
+    panels = [("L0 (% of latents)", [100 * x["l0_pct"] for x in v], "{:.1f}%"),
+              ("Explained variance", [x["explained_variance"] for x in v], "{:.3f}"),
+              ("Dead latents (0%)", [x["dead"] for x in v], "{:,}"),
+              ("Inactive latents (<1%)", [x["firing_lt_1pct"] for x in v], "{:,}")]
+    fig, axes = plt.subplots(1, 4, figsize=(4.2 * 4, 4.4))
+    for ax, (title, vals, fmt) in zip(axes, panels):
+        bars = ax.bar(labels, vals, color="tab:blue")
+        for b, val in zip(bars, vals):
+            ax.annotate(fmt.format(val), (b.get_x() + b.get_width() / 2, b.get_height()),
+                        ha="center", va="bottom", fontsize=10, xytext=(0, 2), textcoords="offset points")
+        ax.set_title(title, fontsize=12); ax.grid(axis="y", alpha=.3)
+        ax.set_ylim(0, max(max(vals) * 1.15, 1))  # counts can all be 0
+    axes[1].set_ylim(0, 1)
+    fig.suptitle(f"Width sweep (L1 {runs[0]['l1_coeff']:g}, validation): expansion and number of latents",
+                 fontsize=13)
     fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
 
 
@@ -179,6 +213,11 @@ def main():
     p.add_argument("--source_run", required=True, help="train_patch_sae run: its cache/ and best checkpoint")
     p.add_argument("--out", required=True)
     p.add_argument("--l1", type=float, nargs="+", required=True)
+    p.add_argument("--widths", type=int, nargs="+", default=None,
+                   help="expansion factors (e.g. 4 8 16 2); runs are named w<k>x_l1_<coeff>. Default: the source run's")
+    p.add_argument("--extend", action="store_true",
+                   help="reopen finished runs and train on to --epochs (patience counter reset)")
+    p.add_argument("--collage_seed", type=int, default=0, help="seed of the random-latent collage per run")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--min_delta", type=float, default=1e-5)
@@ -235,10 +274,11 @@ def main():
         entries = {e["name"]: e for e in json.load(open(summary_path))["models"]}
 
     def write_summary():
-        order = sorted(entries.values(), key=lambda e: (e["l1_coeff"], e["epochs_trained"]))
+        order = sorted(entries.values(), key=lambda e: (e.get("latent_dim") or 0, e["l1_coeff"], e["epochs_trained"]))
         json.dump({"source_run": args.source_run, "data": args.data, "latent_dim": ref["latent_dim"],
                    "target": "L0 < 5% of latents", "models": order}, open(summary_path, "w"), indent=2)
         plot_frontier(order, os.path.join(args.out, "sweep_frontier.png"))
+        plot_width_comparison(order, os.path.join(args.out, "width_comparison.png"))
 
     log("===== reference: first run (100 epochs) =====")
     name = f"l1_{ref['config']['l1_coeff']:.0e}_100ep"
@@ -247,7 +287,8 @@ def main():
         sae.load_state_dict(ref["state_dict"])
         _, _, metrics, _ = evaluate_one(sae, mm, mean_d, scale_d, device, args.out, ctx, figures=False)
         os.replace(os.path.join(args.out, "firing_density.png"), os.path.join(args.out, f"firing_density_{name}.png"))
-        entries[name] = summary_entry(name, ref["config"]["l1_coeff"], len(ref["history"]), ref["epoch"], metrics)
+        entries[name] = summary_entry(name, ref["config"]["l1_coeff"], len(ref["history"]), ref["epoch"], metrics,
+                                      ref["latent_dim"])
         write_summary()
     m = entries[name]["validation"]
     log(f"{name}: L0 {m['l0']:.1f} ({m['l0_pct']:.1%}) | EV {m['explained_variance']:.3f} | dead {m['dead_pct']:.1%}")
@@ -261,39 +302,48 @@ def main():
                     "backbone": ref["backbone"], "representation": ref["representation"], "cache_signature": cache_sig,
                     "dataset": ref["dataset"], "dataset_revision": ref["dataset_revision"], "dataset_path": args.data}
 
-    for coeff in args.l1:
-        name = run_name(coeff)
+    from scripts.latent_collage import random_latent_collage
+    widths = args.widths or [ref["latent_dim"] // D]
+    for width, coeff in [(w, c) for w in widths for c in args.l1]:
+        name = (f"w{width}x_" if args.widths else "") + run_name(coeff)
         run = os.path.join(args.out, name)
         os.makedirs(run, exist_ok=True)
-        if os.path.exists(os.path.join(run, "metrics.json")) and name in entries:
+        if os.path.exists(os.path.join(run, "metrics.json")) and name in entries and not args.extend:
             log(f"===== {name}: done, skipping =====")
             continue
-        log(f"===== {name} =====")
+        log(f"===== {name} ({width * D} latents) =====")
         t0 = time.time()
         torch.manual_seed(args.seed)  # same init for every coefficient
-        sae = ReLUSAE(D, ref["latent_dim"] // D).to(device)
+        sae = ReLUSAE(D, width).to(device)
         cfg = SimpleNamespace(l1_coeff=coeff, lr=args.lr, batch_size=args.batch_size, grad_clip=args.grad_clip,
                               epochs=args.epochs, patience=args.patience, min_delta=args.min_delta, seed=args.seed,
-                              expansion=ref["latent_dim"] // D, patch_size=patch)
-        history = train_one(sae, train_tokens, val_tokens, mean_d, scale_d, run, cfg, base_payload, device)
+                              expansion=width, patch_size=patch)
+        payload = dict(base_payload, latent_dim=sae.latent_dim)
+        history = train_one(sae, train_tokens, val_tokens, mean_d, scale_d, run, cfg, payload, device, args.extend)
         best = torch.load(os.path.join(run, "birds525_patch_sae_best.pt"), map_location="cpu", weights_only=True)
         sae.load_state_dict(best["state_dict"])
         scores, density, metrics, scan = evaluate_one(sae, mm, mean_d, scale_d, device, run, ctx)
         metrics.update(best_epoch=best["epoch"], epochs_run=len(history), l1_coeff=coeff)
         export_one(sae, best, run, scores, density, metrics, scan, history, ctx, mean, scale)
         json.dump(metrics, open(os.path.join(run, "metrics.json"), "w"), indent=2)
-        entries[name] = summary_entry(name, coeff, len(history), best["epoch"], metrics)
+        entries[name] = summary_entry(name, coeff, len(history), best["epoch"], metrics, sae.latent_dim)
         write_summary()
+        res = os.path.join(run, "results", "test_results.pt")
+        shown = random_latent_collage(res, os.path.join(args.out, "random_latent_collages",
+                                                        f"random_latents_{name}_seed{args.collage_seed}.png"),
+                                      seed=args.collage_seed, title=name)
+        log(f"  random-latent collage (seed {args.collage_seed}): latents {shown}")
         m = metrics["validation"]
         log(f"{name}: best epoch {best['epoch']}/{len(history)} | L0 {m['l0']:.1f} ({m['l0_pct']:.1%}) | "
             f"EV {m['explained_variance']:.3f} | MSE {m['mse']:.5f} | dead {m['dead_pct']:.1%} | "
+            f"inactive(<1%) {m['firing_lt_1pct']} | mean firing {m['density_mean']:.2%} | "
             f"{(time.time() - t0) / 60:.0f} min")
 
     log("===== summary =====")
-    for e in sorted(entries.values(), key=lambda e: (e["l1_coeff"], e["epochs_trained"])):
+    for e in sorted(entries.values(), key=lambda e: (e.get("latent_dim") or 0, e["l1_coeff"], e["epochs_trained"])):
         v = e["validation"]
-        log(f"  {e['name']:>16}: L0 {v['l0']:7.1f} ({v['l0_pct']:6.2%}) | EV {v['explained_variance']:.3f} | "
-            f"dead {v['dead_pct']:6.1%}")
+        log(f"  {e['name']:>18}: L0 {v['l0']:7.1f} ({v['l0_pct']:6.2%}) | EV {v['explained_variance']:.3f} | "
+            f"dead {v['dead_pct']:6.1%} | inactive(<1%) {v.get('firing_lt_1pct', 'n/a')}")
     log("===== all done =====")
 
 
