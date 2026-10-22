@@ -7,8 +7,9 @@ region, evidence, alternative, verification test. Works from a results file of
 train_patch_sae.py / sweep_patch_sae.py (results/test_results.pt) and its patch tokens,
 on CPU.
 
-Two prompts (--prompt): "steps" has the VLM write four observations (images, maps, peak
-regions, what the negatives share) before naming; "simple" names directly.
+Prompts (--prompt): "generic" (default) is dataset-agnostic and returns concept, status,
+region, failure_reason (why a mixed/unclear latent was hard) and evidence. "simple" and
+"steps" are the earlier bird-specific prompts, kept for comparing with pilot answers.
 
 Every response is cached under out/responses/latent_<id>_<prompt>_<signature>.json (signature =
 model + prompt + schema + rendered images), so reruns cost nothing and an interrupted
@@ -97,7 +98,38 @@ Your proposed name is a hypothesis, not a verified label.
 DIFFICULTIES = ["none", "inconsistent positives", "scattered activation", "background or frame",
                 "several concepts mixed", "too subtle to see", "negatives look the same"]
 
-PROMPTS = {"simple": "\n\n".join([_HEADER, _SIMPLE, _RULES]),
+_GENERIC = """
+You are interpreting a sparse autoencoder latent from a vision model.
+
+You receive 10 positive examples P1-P10 and 10 negative examples N1-N10.
+Each positive panel contains:
+  left: original image;
+  middle: activation overlay, with brighter regions indicating stronger activation;
+  right: the region around the strongest patch, enlarged.
+Negative panels are images where the latent is weakest.
+N1-N5 look similar to the positives; N6-N10 are random.
+
+Name the visible concept that best distinguishes positives from negatives.
+Use both the original images and the highlighted regions. The overlay is a clue:
+late-layer tokens can encode information from elsewhere in the image.
+Do not interpret the overlay's artificial colors as properties of the subject.
+
+Rules:
+- At most 5 words. No class names, species names, or category names of the subject.
+- Do not invent a shared feature if the examples are inconsistent.
+- status: "coherent" if the positives share the concept, "mixed" if only some do,
+  "unclear" if no shared concept is visible.
+- region: where the concept lies: "subject part", "whole subject", "background",
+  "image frame" (borders, corners, position in the photo), or "mixed".
+- failure_reason: if status is "mixed" or "unclear", one sentence on why the latent was hard
+  to label (what varies or is missing across the examples). If "coherent", return "".
+- evidence: cite example IDs (P/N) for each claim.
+""".strip()
+
+# "generic" is the default: dataset-agnostic wording, four fields. "simple" and "steps" are the
+# earlier bird-specific prompts, kept so cached pilot answers can still be compared.
+PROMPTS = {"generic": _GENERIC,
+           "simple": "\n\n".join([_HEADER, _SIMPLE, _RULES]),
            "steps": "\n\n".join([_HEADER, _STEPS, _RULES])}
 
 _ANSWER = {
@@ -113,9 +145,21 @@ _ANSWER = {
 _STEP_FIELDS = ["images", "maps", "regions", "negatives"]                 # observations, written before the name
 
 
+_GENERIC_ANSWER = {
+    "concept": {"type": "string"},
+    "status": {"type": "string", "enum": ["coherent", "mixed", "unclear"]},
+    "region": {"type": "string", "enum": ["subject part", "whole subject", "background", "image frame", "mixed"]},
+    "failure_reason": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+}
+
+
 def schema(variant):
     """Strict JSON schema; the "steps" variant puts the four observation fields first."""
-    props = ({f: {"type": "string"} for f in _STEP_FIELDS} if variant == "steps" else {}) | _ANSWER
+    if variant == "generic":
+        props = _GENERIC_ANSWER
+    else:
+        props = ({f: {"type": "string"} for f in _STEP_FIELDS} if variant == "steps" else {}) | _ANSWER
     return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
 
@@ -201,7 +245,8 @@ def write_report(out, row, positives, negatives):
                   f"status {row.get('status', '?')}  |  region {row.get('region', '?')}  |  "
                   f"positives from {row['pos_classes']} classes  |  prompt: {row['variant']}"
                   + (f"  |  difficulty: {row['difficulty']}" if row.get("difficulty") not in (None, "none") else "")]
-    alt = textwrap.wrap("alternative: " + str(row.get("alternative", "")), 120)[:2]
+    why = row.get("failure_reason") or row.get("alternative")
+    alt = textwrap.wrap(("why hard: " if row.get("failure_reason") else "alternative: ") + str(why), 120)[:2] if why else []
     head_h, lab_h = 30 + 40 + 28 * (1 + len(alt)) + 10, 34
     sheet = Image.new("RGB", (W, head_h + lab_h + pos.height + lab_h + neg.height), "white")
     d = ImageDraw.Draw(sheet)
@@ -214,8 +259,8 @@ def write_report(out, row, positives, negatives):
     d.text((14, y + 6), "NEGATIVES  (N1-N5 similar, N6-N10 random)", fill="black", font=small)
     sheet.paste(neg, (0, y + lab_h))
     sheet.save(stem + ".png")
-    fields = _STEP_FIELDS + ["status", "concept", "region", "difficulty", "difficulty_note", "evidence",
-                             "alternative", "verification_test"]
+    fields = _STEP_FIELDS + ["status", "concept", "region", "failure_reason", "difficulty", "difficulty_note",
+                             "evidence", "alternative", "verification_test"]
     lines = [f"latent {row['latent']}  (prompt: {row['variant']}, model: {MODEL})", ""]
     for f in fields:
         if f in row and isinstance(row[f], str):
@@ -263,7 +308,8 @@ def compare_report(r, latent, out, variants=("steps", "simple")):
         d.text((x + 4, 120), f"status: {a['status']}", fill=colour.get(a["status"], "black"), font=small)
         d.text((x + 4, 146), f"region: {a['region']}" + (f"   difficulty: {a['difficulty']}" if a.get("difficulty") not in (None, "none") else ""),
                fill=(60, 60, 60), font=small)
-        alt = textwrap.wrap("alternative: " + a.get("alternative", ""), 62)[:2]
+        why = a.get("failure_reason") or a.get("alternative") or ""
+        alt = textwrap.wrap(("why hard: " if a.get("failure_reason") else "alternative: ") + why, 62)[:2] if why else []
         for j, line in enumerate(alt):
             d.text((x + 4, 176 + 24 * j), line, fill=(90, 90, 90), font=small)
     d.text((14, head_h - 4 + 6), f"latent {latent}  -  POSITIVES (original | activation overlay | region at peak)",
@@ -286,7 +332,7 @@ def data_url(im):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def build_request(panels, variant="steps"):
+def build_request(panels, variant="generic"):
     """Responses-API content list plus a cache signature of everything that affects the answer."""
     urls = [data_url(p) for p in panels]
     content = [{"type": "input_text", "text": "Interpret the following examples."}]
@@ -308,7 +354,7 @@ def cost(usage):
             + usage["output_tokens"] * PRICE["output"]) / 1e6
 
 
-def call_vlm(client, content, variant="steps"):
+def call_vlm(client, content, variant="generic"):
     """One structured request; the raw response is returned for saving before parsing."""
     assert client is not None, "no cached answer for this latent: set OPENAI_API_KEY to call the API"
     t0 = time.perf_counter()
@@ -324,7 +370,7 @@ def call_vlm(client, content, variant="steps"):
 
 # ---------------------------------------------------------------- one latent / many latents
 
-def name_latent(r, latent, out, client=None, dry_run=False, variant="steps"):
+def name_latent(r, latent, out, client=None, dry_run=False, variant="generic"):
     """Select examples, render panels, call the VLM (or load the cached answer). Returns a
     summary row. dry_run: render and save the panels and estimate tokens, without an API call."""
     pos, neg = select_examples(r, latent)
@@ -352,15 +398,12 @@ def name_latent(r, latent, out, client=None, dry_run=False, variant="steps"):
     if saved["status"] == "completed":
         ans = json.loads(saved["output_text"])
         row.update({f: ans[f] for f in _STEP_FIELDS if f in ans})
-        row.update(status=ans["status"], concept=ans["concept"], region=ans["region"],
-                   evidence=" | ".join(ans["evidence"]), alternative=ans["alternative"],
-                   verification_test=ans["verification_test"],
-                   difficulty=ans.get("difficulty"), difficulty_note=ans.get("difficulty_note"))
+        row.update({k: (" | ".join(v) if isinstance(v, list) else v) for k, v in ans.items()})
         write_report(out, row, positives, negatives)
     return row
 
 
-def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant="steps", log=print):
+def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant="generic", log=print):
     """Name many latents in parallel; writes out/names_<variant>.csv after every finished latent."""
     rows, failures, t0 = [], [], time.time()
     csv = os.path.join(out, f"names_{variant}.csv" if not dry_run else "dry_run.csv")
@@ -374,7 +417,11 @@ def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant
             except Exception as e:                                      # one failure does not stop the run
                 failures.append({"latent": lat, "error": repr(e)})
                 bar.write(f"  latent {lat} failed: {e!r}")
-            pd.DataFrame(rows).sort_values("latent").to_csv(csv, index=False)
+            merged = pd.DataFrame(rows)
+            if os.path.exists(csv):                                    # keep rows from earlier runs
+                old = pd.read_csv(csv)
+                merged = pd.concat([old[~old["latent"].isin(merged["latent"])], merged], ignore_index=True)
+            merged.sort_values("latent").to_csv(csv, index=False)
             last = rows[-1] if rows and rows[-1]["latent"] == lat else {}
             bar.set_postfix_str(f"${sum(x.get('cost_usd', 0) for x in rows):.4f}, {len(failures)} failed"
                                 + (f" | {lat}: {last.get('concept', '')[:30]}" if last.get("concept") else ""))
@@ -406,8 +453,11 @@ def main():
     p.add_argument("--dry_run", action="store_true", help="render panels and estimate tokens; no API calls")
     p.add_argument("--compare", action="store_true",
                    help="side-by-side figure of the cached steps and simple answers (no API calls)")
-    p.add_argument("--prompt", choices=["steps", "simple"], default="steps",
-                   help="steps: observe images, maps, regions, negatives, then name; simple: name directly")
+    p.add_argument("--prompt", choices=list(PROMPTS), default="generic",
+                   help="generic (default): dataset-agnostic, concept/status/region/failure_reason/evidence; "
+                        "simple, steps: earlier bird-specific prompts")
+    p.add_argument("--compare_prompts", nargs="+", default=["generic", "simple"],
+                   help="prompts shown side by side by --compare")
     args = p.parse_args()
 
     r = load_results(args.results, args.patches)
@@ -422,7 +472,7 @@ def main():
           f"{latents if len(latents) <= 30 else str(latents[:30]) + ' ...'}")
     if args.compare:
         for lat in latents:
-            path, ans = compare_report(r, lat, args.out)
+            path, ans = compare_report(r, lat, args.out, args.compare_prompts)
             print(f"{lat}: " + " | ".join(f"{v}: {a['concept']} ({a['status']})" if a else f"{v}: -" for v, a in ans.items())
                   + f"  -> {path}")
         return
@@ -443,7 +493,8 @@ def main():
         print(f"named {len(done)}/{len(latents)}; cost ${df.get('cost_usd', pd.Series([0])).sum():.4f}; "
               f"mean API time {df.get('api_seconds', pd.Series([0])).mean():.1f}s")
         if len(done):
-            print(done[["latent", "status", "region", "difficulty", "concept", "pos_classes"]].to_string(index=False))
+            cols = [c for c in ["latent", "status", "region", "concept", "failure_reason", "pos_classes"] if c in done]
+            print(done[cols].to_string(index=False, max_colwidth=70))
             print(f"tokens per latent: input {done['input_tokens'].mean():,.0f}, output {done['output_tokens'].mean():,.0f}")
             print("\nstatus:", done["status"].value_counts().to_dict(), "| region:", done["region"].value_counts().to_dict())
 
