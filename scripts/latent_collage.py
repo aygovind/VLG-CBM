@@ -31,11 +31,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 from PIL import Image  # noqa: E402
 
 
-def load_results(path):
-    """test_results.pt plus a memory map of the test patches it refers to."""
+def load_results(path, patches=None):
+    """test_results.pt plus a memory map of the test patches it refers to.
+    patches: override the stored path (e.g. a local copy of /shared/.../test_patches.npy)."""
     r = torch.load(path, map_location="cpu", weights_only=False)
-    patches = r["patches_file"]
-    if not os.path.isabs(patches):  # the first run stores it next to the results file
+    patches = patches or r["patches_file"]
+    if not os.path.isabs(patches) and not os.path.exists(patches):  # the first run stores it next to the results
         patches = os.path.join(os.path.dirname(path), patches)
     r["patches"] = np.load(patches, mmap_mode="r")
     assert r["patches"].shape[0] == len(r["labels"]), "patches and results cover different images"
@@ -61,15 +62,22 @@ def pick_latents(r, n_latents, n_images, seed):
     return sorted(chosen.tolist()), len(alive)
 
 
-def random_latent_collage(results, out_path, n_latents=5, n_images=5, seed=0, title=None, latents=None):
-    """Collage of n_latents random latents (rows) x their top n_images test images.
-    results: a path or an already loaded results dict. latents: override the random pick.
-    Returns the latent ids shown."""
+def random_latent_collage(results, out_path, n_latents=5, n_images=5, seed=0, title=None, latents=None, mode="random"):
+    """Collage of n_latents latents (rows) x their top n_images test images.
+    mode: "random" (seeded pick among latents firing on >= n_images images) or "top" (the
+    n_latents most coherent latents: highest mean CLS cosine of their top-12 test images,
+    the ranking behind top_latents/). results: a path or a loaded results dict.
+    latents: override the pick. Returns the latent ids shown."""
     r = load_results(results) if isinstance(results, str) else results
-    if latents is None:
+    n_alive = int(((r["scores"] > 0).sum(0) >= n_images).sum())
+    if latents is None and mode == "top":
+        latents = r["scan"]["order"][:n_latents].tolist()
+        how = f"top {len(latents)} latents by CLS cosine similarity of their top-12 test images"
+    elif latents is None:
         latents, n_alive = pick_latents(r, n_latents, n_images, seed)
+        how = f"{len(latents)} random latents (seed {seed}, from {n_alive} firing on >= {n_images} test images)"
     else:
-        n_alive = int(((r["scores"] > 0).sum(0) >= n_images).sum())
+        how = f"{len(latents)} selected latents"
     if not latents:
         print(f"no latent fires on >= {n_images} test images; nothing to draw")
         return []
@@ -102,8 +110,7 @@ def random_latent_collage(results, out_path, n_latents=5, n_images=5, seed=0, ti
         title = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(results)))) \
             if isinstance(results, str) else ""
     model = title
-    fig.suptitle(f"{model}: {len(latents)} random latents (seed {seed}, from {n_alive} firing on "
-                 f">= {n_images} test images), top {n_images} test images each", fontsize=14)
+    fig.suptitle(f"{model}: {how}, top {n_images} test images each", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     fig.savefig(out_path, dpi=110, bbox_inches="tight")
@@ -119,11 +126,13 @@ def main():
     p.add_argument("--n_latents", type=int, default=5)
     p.add_argument("--n_images", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--mode", choices=["random", "top"], default="random")
     args = p.parse_args()
     names = args.names or [os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(f)))) for f in args.results]
     for path, name in zip(args.results, names):
-        out = os.path.join(args.out_dir, f"random_latents_{name}_seed{args.seed}.png")
-        shown = random_latent_collage(path, out, args.n_latents, args.n_images, args.seed, title=name)
+        out = os.path.join(args.out_dir, f"random_latents_{name}_seed{args.seed}.png" if args.mode == "random"
+                           else f"top_coherence_latents_{name}.png")
+        shown = random_latent_collage(path, out, args.n_latents, args.n_images, args.seed, title=name, mode=args.mode)
         print(f"{name}: latents {shown} -> {out}", flush=True)
 
 
