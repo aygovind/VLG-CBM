@@ -89,8 +89,13 @@ Return status "coherent", "mixed", or "unclear".
 Return region: where the concept lies — "bird part" (a specific part or marking),
 "whole bird" (overall shape, colour or posture), "background" (scenery, perch, water,
 foliage), "image frame" (borders, corners, position in the photo) or "mixed".
+If status is "mixed" or "unclear", set difficulty to the main reason labelling was hard
+and explain it in difficulty_note (one sentence); if "coherent", use "none" and "".
 Your proposed name is a hypothesis, not a verified label.
 """.strip()
+
+DIFFICULTIES = ["none", "inconsistent positives", "scattered activation", "background or frame",
+                "several concepts mixed", "too subtle to see", "negatives look the same"]
 
 PROMPTS = {"simple": "\n\n".join([_HEADER, _SIMPLE, _RULES]),
            "steps": "\n\n".join([_HEADER, _STEPS, _RULES])}
@@ -102,6 +107,8 @@ _ANSWER = {
         "evidence": {"type": "array", "items": {"type": "string"}},
         "alternative": {"type": "string"},
         "verification_test": {"type": "string"},
+        "difficulty": {"type": "string", "enum": DIFFICULTIES},
+        "difficulty_note": {"type": "string"},
 }
 _STEP_FIELDS = ["images", "maps", "regions", "negatives"]                 # observations, written before the name
 
@@ -192,7 +199,8 @@ def write_report(out, row, positives, negatives):
     W = max(pos.width, neg.width)
     head_lines = [f"latent {row['latent']}:  \"{row.get('concept', '?')}\"",
                   f"status {row.get('status', '?')}  |  region {row.get('region', '?')}  |  "
-                  f"positives from {row['pos_classes']} classes  |  prompt: {row['variant']}"]
+                  f"positives from {row['pos_classes']} classes  |  prompt: {row['variant']}"
+                  + (f"  |  difficulty: {row['difficulty']}" if row.get("difficulty") not in (None, "none") else "")]
     alt = textwrap.wrap("alternative: " + str(row.get("alternative", "")), 120)[:2]
     head_h, lab_h = 30 + 40 + 28 * (1 + len(alt)) + 10, 34
     sheet = Image.new("RGB", (W, head_h + lab_h + pos.height + lab_h + neg.height), "white")
@@ -206,7 +214,8 @@ def write_report(out, row, positives, negatives):
     d.text((14, y + 6), "NEGATIVES  (N1-N5 similar, N6-N10 random)", fill="black", font=small)
     sheet.paste(neg, (0, y + lab_h))
     sheet.save(stem + ".png")
-    fields = _STEP_FIELDS + ["status", "concept", "region", "evidence", "alternative", "verification_test"]
+    fields = _STEP_FIELDS + ["status", "concept", "region", "difficulty", "difficulty_note", "evidence",
+                             "alternative", "verification_test"]
     lines = [f"latent {row['latent']}  (prompt: {row['variant']}, model: {MODEL})", ""]
     for f in fields:
         if f in row and isinstance(row[f], str):
@@ -297,7 +306,8 @@ def name_latent(r, latent, out, client=None, dry_run=False, variant="steps"):
         row.update({f: ans[f] for f in _STEP_FIELDS if f in ans})
         row.update(status=ans["status"], concept=ans["concept"], region=ans["region"],
                    evidence=" | ".join(ans["evidence"]), alternative=ans["alternative"],
-                   verification_test=ans["verification_test"])
+                   verification_test=ans["verification_test"],
+                   difficulty=ans.get("difficulty"), difficulty_note=ans.get("difficulty_note"))
         write_report(out, row, positives, negatives)
     return row
 
@@ -377,7 +387,7 @@ def main():
         print(f"named {len(done)}/{len(latents)}; cost ${df.get('cost_usd', pd.Series([0])).sum():.4f}; "
               f"mean API time {df.get('api_seconds', pd.Series([0])).mean():.1f}s")
         if len(done):
-            print(done[["latent", "status", "region", "concept", "pos_classes"]].to_string(index=False))
+            print(done[["latent", "status", "region", "difficulty", "concept", "pos_classes"]].to_string(index=False))
             print(f"tokens per latent: input {done['input_tokens'].mean():,.0f}, output {done['output_tokens'].mean():,.0f}")
             print("\nstatus:", done["status"].value_counts().to_dict(), "| region:", done["region"].value_counts().to_dict())
 
