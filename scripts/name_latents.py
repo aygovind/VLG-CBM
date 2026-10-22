@@ -12,7 +12,8 @@ regions, what the negatives share) before naming; "simple" names directly.
 
 Every response is cached under out/responses/latent_<id>_<prompt>_<signature>.json (signature =
 model + prompt + schema + rendered images), so reruns cost nothing and an interrupted
-run resumes. Summary: out/names.csv (one row per latent, with the class make-up of the
+run resumes. Per latent: out/reports/latent_<id>_<prompt>.png (the panels sent, with the predicted label)
+and .txt (the full answer). Summary: out/names_<prompt>.csv (one row per latent, with the class make-up of the
 positives, never shown to the VLM, for a later class-detector filter).
 
   python -m scripts.name_latents --results R.pt --patches P.npy --out naming --random 20 --dry_run
@@ -33,7 +34,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+import textwrap
+from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 from scripts.latent_collage import latent_maps, load_results
@@ -180,6 +182,45 @@ def contact_sheet(panels, columns):
     return sheet
 
 
+def write_report(out, row, positives, negatives):
+    """reports/latent_<id>_<prompt>.png: the panels sent, under a header with the predicted
+    label; reports/latent_<id>_<prompt>.txt: the full answer (observations, evidence, ...)."""
+    os.makedirs(os.path.join(out, "reports"), exist_ok=True)
+    stem = os.path.join(out, "reports", f"latent_{row['latent']}_{row['variant']}")
+    pos, neg = contact_sheet(positives, 2), contact_sheet(negatives, 5)
+    big, small = ImageFont.load_default(size=30), ImageFont.load_default(size=20)
+    W = max(pos.width, neg.width)
+    head_lines = [f"latent {row['latent']}:  \"{row.get('concept', '?')}\"",
+                  f"status {row.get('status', '?')}  |  region {row.get('region', '?')}  |  "
+                  f"positives from {row['pos_classes']} classes  |  prompt: {row['variant']}"]
+    alt = textwrap.wrap("alternative: " + str(row.get("alternative", "")), 120)[:2]
+    head_h, lab_h = 30 + 40 + 28 * (1 + len(alt)) + 10, 34
+    sheet = Image.new("RGB", (W, head_h + lab_h + pos.height + lab_h + neg.height), "white")
+    d = ImageDraw.Draw(sheet)
+    d.text((14, 12), head_lines[0], fill="black", font=big)
+    for k, line in enumerate([head_lines[1]] + alt):
+        d.text((14, 56 + 28 * k), line, fill=(60, 60, 60), font=small)
+    y = head_h
+    d.text((14, y + 6), "POSITIVES  (original | activation overlay | region at peak)", fill="black", font=small)
+    sheet.paste(pos, (0, y + lab_h)); y += lab_h + pos.height
+    d.text((14, y + 6), "NEGATIVES  (N1-N5 similar, N6-N10 random)", fill="black", font=small)
+    sheet.paste(neg, (0, y + lab_h))
+    sheet.save(stem + ".png")
+    fields = _STEP_FIELDS + ["status", "concept", "region", "evidence", "alternative", "verification_test"]
+    lines = [f"latent {row['latent']}  (prompt: {row['variant']}, model: {MODEL})", ""]
+    for f in fields:
+        if f in row and isinstance(row[f], str):
+            body = row[f].replace(" | ", "\n  - ") if f == "evidence" else row[f]
+            lines += [f"{f.upper()}:", textwrap.fill(body, 100, initial_indent="  ", subsequent_indent="  ")
+                      if f != "evidence" else "  - " + body, ""]
+    lines += [f"positive images (test ids): {row['positive_images']}",
+              f"negative images (test ids): {row['negative_images']}",
+              f"positives span {row['pos_classes']} classes, at most {row['pos_max_same_class']} from one class",
+              f"tokens: input {row.get('input_tokens')}, output {row.get('output_tokens')}; "
+              f"cost ${row.get('original_cost_usd', 0):.6f}{' (cached answer; no new charge this run)' if row.get('cached') else ''}"]
+    open(stem + ".txt", "w").write("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------- request
 
 def data_url(im):
@@ -212,6 +253,7 @@ def cost(usage):
 
 def call_vlm(client, content, variant="steps"):
     """One structured request; the raw response is returned for saving before parsing."""
+    assert client is not None, "no cached answer for this latent: set OPENAI_API_KEY to call the API"
     t0 = time.perf_counter()
     resp = client.responses.create(
         model=MODEL, instructions=PROMPTS[variant], input=[{"role": "user", "content": content}],
@@ -248,6 +290,7 @@ def name_latent(r, latent, out, client=None, dry_run=False, variant="steps"):
         json.dump(saved, open(path, "w"), indent=2)                    # saved before parsing: no silent retries
     row.update(cached=cached, api_status=saved["status"], input_tokens=saved["usage"]["input_tokens"],
                output_tokens=saved["usage"]["output_tokens"], cost_usd=0.0 if cached else cost(saved["usage"]),
+               original_cost_usd=cost(saved["usage"]),
                api_seconds=0.0 if cached else saved["api_seconds"])
     if saved["status"] == "completed":
         ans = json.loads(saved["output_text"])
@@ -255,6 +298,7 @@ def name_latent(r, latent, out, client=None, dry_run=False, variant="steps"):
         row.update(status=ans["status"], concept=ans["concept"], region=ans["region"],
                    evidence=" | ".join(ans["evidence"]), alternative=ans["alternative"],
                    verification_test=ans["verification_test"])
+        write_report(out, row, positives, negatives)
     return row
 
 
@@ -319,8 +363,10 @@ def main():
     client = None
     if not args.dry_run:
         from openai import OpenAI
-        assert os.environ.get("OPENAI_API_KEY"), "set OPENAI_API_KEY first"
-        client = OpenAI(timeout=180, max_retries=2)
+        if os.environ.get("OPENAI_API_KEY"):
+            client = OpenAI(timeout=180, max_retries=2)
+        else:
+            print("OPENAI_API_KEY not set: only latents with cached answers can be reported")
     df, fails = name_latents(r, latents, args.out, client, args.workers, args.dry_run, args.prompt)
     if args.dry_run:
         tok = df["est_image_tokens"].mean() + 350
