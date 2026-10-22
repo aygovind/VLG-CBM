@@ -403,8 +403,9 @@ def name_latent(r, latent, out, client=None, dry_run=False, variant="generic"):
     return row
 
 
-def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant="generic", log=print):
-    """Name many latents in parallel; writes out/names_<variant>.csv after every finished latent."""
+def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant="generic", log=print, max_cost=None):
+    """Name many latents in parallel; writes out/names_<variant>.csv after every finished latent.
+    max_cost: stop submitting once this many USD have been spent in this run."""
     rows, failures, t0 = [], [], time.time()
     csv = os.path.join(out, f"names_{variant}.csv" if not dry_run else "dry_run.csv")
     bar = tqdm(total=len(latents), desc="rendering" if dry_run else f"naming ({variant})", unit="latent")
@@ -426,6 +427,10 @@ def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant
             bar.set_postfix_str(f"${sum(x.get('cost_usd', 0) for x in rows):.4f}, {len(failures)} failed"
                                 + (f" | {lat}: {last.get('concept', '')[:30]}" if last.get("concept") else ""))
             bar.update(1)
+            if max_cost is not None and sum(x.get("cost_usd", 0) for x in rows) > max_cost:
+                bar.write(f"  spending cap ${max_cost:.2f} reached: cancelling the remaining latents")
+                pool.shutdown(wait=True, cancel_futures=True)
+                break
     bar.close()
     log(f"done: {len(rows)}/{len(latents)} latents, {len(failures)} failed, {time.time() - t0:.0f}s")
     if failures:
@@ -450,6 +455,7 @@ def main():
     who.add_argument("--all", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--max_cost", type=float, default=None, help="stop once this many USD are spent in this run")
     p.add_argument("--dry_run", action="store_true", help="render panels and estimate tokens; no API calls")
     p.add_argument("--compare", action="store_true",
                    help="side-by-side figure of the cached steps and simple answers (no API calls)")
@@ -483,7 +489,8 @@ def main():
             client = OpenAI(timeout=180, max_retries=2)
         else:
             print("OPENAI_API_KEY not set: only latents with cached answers can be reported")
-    df, fails = name_latents(r, latents, args.out, client, args.workers, args.dry_run, args.prompt)
+    df, fails = name_latents(r, latents, args.out, client, args.workers, args.dry_run, args.prompt,
+                             max_cost=args.max_cost)
     if args.dry_run:
         tok = df["est_image_tokens"].mean() + 350
         print(f"estimated input tokens per latent ~{tok:,.0f} -> ~${tok * PRICE['input'] / 1e6 * len(ok):.2f} "
