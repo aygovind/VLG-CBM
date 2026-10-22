@@ -7,7 +7,10 @@ region, evidence, alternative, verification test. Works from a results file of
 train_patch_sae.py / sweep_patch_sae.py (results/test_results.pt) and its patch tokens,
 on CPU.
 
-Every response is cached under out/responses/latent_<id>_<signature>.json (signature =
+Two prompts (--prompt): "steps" has the VLM write four observations (images, maps, peak
+regions, what the negatives share) before naming; "simple" names directly.
+
+Every response is cached under out/responses/latent_<id>_<prompt>_<signature>.json (signature =
 model + prompt + schema + rendered images), so reruns cost nothing and an interrupted
 run resumes. Summary: out/names.csv (one row per latent, with the class make-up of the
 positives, never shown to the VLM, for a later class-detector filter).
@@ -39,7 +42,7 @@ PRICE = {"input": 0.10, "cached": 0.01, "output": 0.50}       # USD per million 
 N_POS, N_HARD, N_RANDOM = 10, 5, 5
 OFF = 0.05          # a latent is "off" in an image if its max activation < OFF x its max over the test set
 
-PROMPT = """
+_HEADER = """
 You are interpreting a sparse autoencoder latent from a vision model trained on bird photos.
 
 You receive 10 positive examples P1-P10 and 10 negative examples N1-N10.
@@ -49,9 +52,27 @@ Each positive panel contains:
   right: the region around the strongest patch, enlarged.
 Negative panels are original images where the latent is essentially inactive.
 N1-N5 were chosen to look similar to the positives; N6-N10 are random.
+""".strip()
 
+_SIMPLE = """
 Infer the visible concept that best distinguishes positives from negatives.
-Use both the original images and the highlighted regions. The overlay is a clue:
+Use both the original images and the highlighted regions.
+""".strip()
+
+_STEPS = """
+Work step by step, filling the fields in order:
+1. images: what do the positive originals have in common (subject, pose, colours, scene)?
+2. maps: where do the activations fall (which body part / background / frame edge) and how
+   are they distributed (one compact region, several spots, scattered)?
+3. regions: what do the enlarged peak regions have in common (texture, colour, shape)?
+4. negatives: which of these features also appear in the negatives (especially N1-N5)?
+   Those features do NOT explain the latent.
+5. concept: name the feature common to steps 1-3 that is absent from the negatives.
+Base "region" on step 2, and "status" on how consistent steps 1-3 are.
+""".strip()
+
+_RULES = """
+The overlay is a clue:
 late-layer tokens can encode information from elsewhere in the image.
 Do not interpret the overlay's artificial colors as properties of the bird.
 The enlarged region adds no new visual information.
@@ -68,19 +89,24 @@ foliage), "image frame" (borders, corners, position in the photo) or "mixed".
 Your proposed name is a hypothesis, not a verified label.
 """.strip()
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
+PROMPTS = {"simple": "\n\n".join([_HEADER, _SIMPLE, _RULES]),
+           "steps": "\n\n".join([_HEADER, _STEPS, _RULES])}
+
+_ANSWER = {
         "status": {"type": "string", "enum": ["coherent", "mixed", "unclear"]},
         "concept": {"type": "string"},
         "region": {"type": "string", "enum": ["bird part", "whole bird", "background", "image frame", "mixed"]},
         "evidence": {"type": "array", "items": {"type": "string"}},
         "alternative": {"type": "string"},
         "verification_test": {"type": "string"},
-    },
-    "required": ["status", "concept", "region", "evidence", "alternative", "verification_test"],
-    "additionalProperties": False,
 }
+_STEP_FIELDS = ["images", "maps", "regions", "negatives"]                 # observations, written before the name
+
+
+def schema(variant):
+    """Strict JSON schema; the "steps" variant puts the four observation fields first."""
+    props = ({f: {"type": "string"} for f in _STEP_FIELDS} if variant == "steps" else {}) | _ANSWER
+    return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
 
 
 # ---------------------------------------------------------------- examples
@@ -161,12 +187,12 @@ def data_url(im):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def build_request(panels):
+def build_request(panels, variant="steps"):
     """Responses-API content list plus a cache signature of everything that affects the answer."""
     urls = [data_url(p) for p in panels]
     content = [{"type": "input_text", "text": "Interpret the following examples."}]
     content += [{"type": "input_image", "image_url": u, "detail": "high"} for u in urls]
-    sig = hashlib.sha256(json.dumps({"model": MODEL, "prompt": PROMPT, "schema": SCHEMA, "images": urls,
+    sig = hashlib.sha256(json.dumps({"model": MODEL, "prompt": PROMPTS[variant], "schema": schema(variant), "images": urls,
                                      "reasoning": "none", "max_output_tokens": 700},
                                     sort_keys=True).encode()).hexdigest()[:16]
     return content, sig
@@ -183,13 +209,14 @@ def cost(usage):
             + usage["output_tokens"] * PRICE["output"]) / 1e6
 
 
-def call_vlm(client, content):
+def call_vlm(client, content, variant="steps"):
     """One structured request; the raw response is returned for saving before parsing."""
     t0 = time.perf_counter()
     resp = client.responses.create(
-        model=MODEL, instructions=PROMPT, input=[{"role": "user", "content": content}],
+        model=MODEL, instructions=PROMPTS[variant], input=[{"role": "user", "content": content}],
         reasoning={"effort": "none"},
-        text={"format": {"type": "json_schema", "name": "latent_interpretation", "strict": True, "schema": SCHEMA}},
+        text={"format": {"type": "json_schema", "name": "latent_interpretation", "strict": True,
+                         "schema": schema(variant)}},
         max_output_tokens=700, service_tier="default", store=False)
     return {"response_id": resp.id, "model": resp.model, "status": resp.status, "output_text": resp.output_text,
             "usage": resp.usage.model_dump(), "api_seconds": time.perf_counter() - t0}
@@ -197,25 +224,25 @@ def call_vlm(client, content):
 
 # ---------------------------------------------------------------- one latent / many latents
 
-def name_latent(r, latent, out, client=None, dry_run=False):
+def name_latent(r, latent, out, client=None, dry_run=False, variant="steps"):
     """Select examples, render panels, call the VLM (or load the cached answer). Returns a
     summary row. dry_run: render and save the panels and estimate tokens, without an API call."""
     pos, neg = select_examples(r, latent)
     positives, negatives = render(r, latent, pos, neg)
-    content, sig = build_request(positives + negatives)
+    content, sig = build_request(positives + negatives, variant)
     os.makedirs(os.path.join(out, "panels"), exist_ok=True)
     os.makedirs(os.path.join(out, "responses"), exist_ok=True)
     contact_sheet(positives, 2).save(os.path.join(out, "panels", f"latent_{latent}_positives.png"))
     contact_sheet(negatives, 5).save(os.path.join(out, "panels", f"latent_{latent}_negatives.png"))
     labels = r["labels"][pos].tolist()
-    row = {"latent": latent, "signature": sig, "est_image_tokens": image_tokens(positives + negatives),
+    row = {"latent": latent, "variant": variant, "signature": sig, "est_image_tokens": image_tokens(positives + negatives),
            "pos_classes": len(set(labels)), "pos_max_same_class": max(labels.count(c) for c in set(labels)),
            "positive_images": pos, "negative_images": neg}
     if dry_run:
         return row
-    path = os.path.join(out, "responses", f"latent_{latent}_{sig}.json")
+    path = os.path.join(out, "responses", f"latent_{latent}_{variant}_{sig}.json")
     cached = os.path.exists(path)
-    saved = json.load(open(path)) if cached else call_vlm(client, content)
+    saved = json.load(open(path)) if cached else call_vlm(client, content, variant)
     if not cached:
         json.dump(saved, open(path, "w"), indent=2)                    # saved before parsing: no silent retries
     row.update(cached=cached, api_status=saved["status"], input_tokens=saved["usage"]["input_tokens"],
@@ -223,18 +250,19 @@ def name_latent(r, latent, out, client=None, dry_run=False):
                api_seconds=0.0 if cached else saved["api_seconds"])
     if saved["status"] == "completed":
         ans = json.loads(saved["output_text"])
+        row.update({f: ans[f] for f in _STEP_FIELDS if f in ans})
         row.update(status=ans["status"], concept=ans["concept"], region=ans["region"],
                    evidence=" | ".join(ans["evidence"]), alternative=ans["alternative"],
                    verification_test=ans["verification_test"])
     return row
 
 
-def name_latents(r, latents, out, client=None, workers=4, dry_run=False, log=print):
-    """Name many latents in parallel; writes out/names.csv after every finished latent."""
+def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant="steps", log=print):
+    """Name many latents in parallel; writes out/names_<variant>.csv after every finished latent."""
     rows, failures, t0 = [], [], time.time()
-    csv = os.path.join(out, "names.csv" if not dry_run else "dry_run.csv")
+    csv = os.path.join(out, f"names_{variant}.csv" if not dry_run else "dry_run.csv")
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(name_latent, r, lat, out, client, dry_run): lat for lat in latents}
+        futures = {pool.submit(name_latent, r, lat, out, client, dry_run, variant): lat for lat in latents}
         for k, fut in enumerate(as_completed(futures), start=1):
             lat = futures[fut]
             try:
@@ -246,7 +274,7 @@ def name_latents(r, latents, out, client=None, workers=4, dry_run=False, log=pri
                 spent = sum(x.get("cost_usd", 0) for x in rows)
                 log(f"  {k}/{len(latents)} latents, {len(failures)} failed, ${spent:.4f}, {time.time() - t0:.0f}s")
     if failures:
-        pd.DataFrame(failures).to_csv(os.path.join(out, "failures.csv"), index=False)
+        pd.DataFrame(failures).to_csv(os.path.join(out, f"failures_{variant}.csv"), index=False)
     return pd.DataFrame(rows).sort_values("latent").reset_index(drop=True), failures
 
 
@@ -268,6 +296,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--dry_run", action="store_true", help="render panels and estimate tokens; no API calls")
+    p.add_argument("--prompt", choices=["steps", "simple"], default="steps",
+                   help="steps: observe images, maps, regions, negatives, then name; simple: name directly")
     args = p.parse_args()
 
     r = load_results(args.results, args.patches)
@@ -285,7 +315,7 @@ def main():
         from openai import OpenAI
         assert os.environ.get("OPENAI_API_KEY"), "set OPENAI_API_KEY first"
         client = OpenAI(timeout=180, max_retries=2)
-    df, fails = name_latents(r, latents, args.out, client, args.workers, args.dry_run)
+    df, fails = name_latents(r, latents, args.out, client, args.workers, args.dry_run, args.prompt)
     if args.dry_run:
         tok = df["est_image_tokens"].mean() + 350
         print(f"estimated input tokens per latent ~{tok:,.0f} -> ~${tok * PRICE['input'] / 1e6 * len(ok):.2f} "
@@ -296,6 +326,7 @@ def main():
               f"mean API time {df.get('api_seconds', pd.Series([0])).mean():.1f}s")
         if len(done):
             print(done[["latent", "status", "region", "concept", "pos_classes"]].to_string(index=False))
+            print(f"tokens per latent: input {done['input_tokens'].mean():,.0f}, output {done['output_tokens'].mean():,.0f}")
             print("\nstatus:", done["status"].value_counts().to_dict(), "| region:", done["region"].value_counts().to_dict())
 
 
