@@ -34,6 +34,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
+from tqdm.auto import tqdm
 
 from scripts.latent_collage import latent_maps, load_results
 
@@ -261,18 +262,23 @@ def name_latents(r, latents, out, client=None, workers=4, dry_run=False, variant
     """Name many latents in parallel; writes out/names_<variant>.csv after every finished latent."""
     rows, failures, t0 = [], [], time.time()
     csv = os.path.join(out, f"names_{variant}.csv" if not dry_run else "dry_run.csv")
+    bar = tqdm(total=len(latents), desc="rendering" if dry_run else f"naming ({variant})", unit="latent")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(name_latent, r, lat, out, client, dry_run, variant): lat for lat in latents}
-        for k, fut in enumerate(as_completed(futures), start=1):
+        for fut in as_completed(futures):
             lat = futures[fut]
             try:
                 rows.append(fut.result())
             except Exception as e:                                      # one failure does not stop the run
                 failures.append({"latent": lat, "error": repr(e)})
+                bar.write(f"  latent {lat} failed: {e!r}")
             pd.DataFrame(rows).sort_values("latent").to_csv(csv, index=False)
-            if k % max(1, len(latents) // 10) == 0 or k == len(latents):
-                spent = sum(x.get("cost_usd", 0) for x in rows)
-                log(f"  {k}/{len(latents)} latents, {len(failures)} failed, ${spent:.4f}, {time.time() - t0:.0f}s")
+            last = rows[-1] if rows and rows[-1]["latent"] == lat else {}
+            bar.set_postfix_str(f"${sum(x.get('cost_usd', 0) for x in rows):.4f}, {len(failures)} failed"
+                                + (f" | {lat}: {last.get('concept', '')[:30]}" if last.get("concept") else ""))
+            bar.update(1)
+    bar.close()
+    log(f"done: {len(rows)}/{len(latents)} latents, {len(failures)} failed, {time.time() - t0:.0f}s")
     if failures:
         pd.DataFrame(failures).to_csv(os.path.join(out, f"failures_{variant}.csv"), index=False)
     return pd.DataFrame(rows).sort_values("latent").reset_index(drop=True), failures
