@@ -230,6 +230,54 @@ def write_report(out, row, positives, negatives):
     open(stem + ".txt", "w").write("\n".join(lines) + "\n")
 
 
+def latest_answer(out, latent, variant):
+    """Newest cached completed answer for a latent and prompt (any prompt version), or None."""
+    import glob
+    files = sorted(glob.glob(os.path.join(out, "responses", f"latent_{latent}_{variant}_*.json")), key=os.path.getmtime)
+    for f in reversed(files):
+        saved = json.load(open(f))
+        if saved["status"] == "completed":
+            return json.loads(saved["output_text"])
+    return None
+
+
+def compare_report(r, latent, out, variants=("steps", "simple")):
+    """reports/compare_latent_<id>.png: the panels once, with each prompt's answer side by side."""
+    answers = {v: latest_answer(out, latent, v) for v in variants}
+    pos, neg = select_examples(r, latent)
+    positives, negatives = render(r, latent, pos, neg)
+    psheet, nsheet = contact_sheet(positives, 2), contact_sheet(negatives, 5)
+    big, small = ImageFont.load_default(size=28), ImageFont.load_default(size=19)
+    W, col = max(psheet.width, nsheet.width), max(psheet.width, nsheet.width) // len(variants)
+    head_h, lab_h = 250, 34
+    sheet = Image.new("RGB", (W, head_h + lab_h + psheet.height + lab_h + nsheet.height), "white")
+    d = ImageDraw.Draw(sheet)
+    for k, v in enumerate(variants):
+        x, a = 14 + k * col, answers[v]
+        colour = {"coherent": (20, 120, 40), "mixed": (190, 110, 0), "unclear": (180, 30, 30)}
+        d.rectangle([x - 6, 8, x + col - 22, head_h - 10], outline=(180, 180, 180), width=2)
+        d.text((x + 4, 14), f"{v} prompt", fill=(90, 90, 90), font=small)
+        if a is None:
+            d.text((x + 4, 50), "no cached answer", fill="black", font=big); continue
+        d.text((x + 4, 44), "\n".join(textwrap.wrap(f"\"{a['concept']}\"", 38))[:120], fill="black", font=big)
+        d.text((x + 4, 120), f"status: {a['status']}", fill=colour.get(a["status"], "black"), font=small)
+        d.text((x + 4, 146), f"region: {a['region']}" + (f"   difficulty: {a['difficulty']}" if a.get("difficulty") not in (None, "none") else ""),
+               fill=(60, 60, 60), font=small)
+        alt = textwrap.wrap("alternative: " + a.get("alternative", ""), 62)[:2]
+        for j, line in enumerate(alt):
+            d.text((x + 4, 176 + 24 * j), line, fill=(90, 90, 90), font=small)
+    d.text((14, head_h - 4 + 6), f"latent {latent}  -  POSITIVES (original | activation overlay | region at peak)",
+           fill="black", font=small)
+    sheet.paste(psheet, (0, head_h + lab_h))
+    y = head_h + lab_h + psheet.height
+    d.text((14, y + 6), "NEGATIVES  (N1-N5 similar, N6-N10 random)", fill="black", font=small)
+    sheet.paste(nsheet, (0, y + lab_h))
+    os.makedirs(os.path.join(out, "reports"), exist_ok=True)
+    path = os.path.join(out, "reports", f"compare_latent_{latent}.png")
+    sheet.save(path)
+    return path, answers
+
+
 # ---------------------------------------------------------------- request
 
 def data_url(im):
@@ -356,6 +404,8 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--dry_run", action="store_true", help="render panels and estimate tokens; no API calls")
+    p.add_argument("--compare", action="store_true",
+                   help="side-by-side figure of the cached steps and simple answers (no API calls)")
     p.add_argument("--prompt", choices=["steps", "simple"], default="steps",
                    help="steps: observe images, maps, regions, negatives, then name; simple: name directly")
     args = p.parse_args()
@@ -370,6 +420,12 @@ def main():
         latents = ok
     print(f"{len(ok):,}/{r['scores'].shape[1]:,} latents eligible; naming {len(latents)}: "
           f"{latents if len(latents) <= 30 else str(latents[:30]) + ' ...'}")
+    if args.compare:
+        for lat in latents:
+            path, ans = compare_report(r, lat, args.out)
+            print(f"{lat}: " + " | ".join(f"{v}: {a['concept']} ({a['status']})" if a else f"{v}: -" for v, a in ans.items())
+                  + f"  -> {path}")
+        return
     client = None
     if not args.dry_run:
         from openai import OpenAI
