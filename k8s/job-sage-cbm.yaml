@@ -1,0 +1,86 @@
+# SAGE-CBM on Birds-525 (scripts/sage_cbm.py): SAE latents of the 4x patch SAE as the concept
+# layer, VLG-CBM's GLM-SAGA final layer on top. CPU only: the concept scores are one linear
+# layer over cached tokens, and the final layer is a 524-class linear model.
+#
+# The script and the kept-latent list come from a ConfigMap, so this runs without a git push:
+#   kubectl create configmap sage-cbm-script --from-file=sage_cbm.py=scripts/sage_cbm.py \
+#       --from-file=concepts_kept.csv=<latent ids of the kept concepts>
+# The VLG-CBM checkout on the volume supplies model.cbm (FinalLayer, train_sparse_final) and
+# glm_saga, unchanged since the VLG-CBM runs.
+#
+# Stages: 1. smoke test on 1,000 images per split; 2. main result at VLG-CBM's lambda 0.0007
+# (all 3,072 latents and the 1,485 kept); 3. lambda sweep for matched sparsity. Resumable:
+# finished runs are skipped. Outputs in /shared/sage_cbm/w4x/.
+#
+# Submit:  kubectl apply -f k8s/job-sage-cbm.yaml
+# Watch:   kubectl logs -f job/sage-cbm -c sage | grep -E "=====|concepts|test acc|FATAL|Traceback"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sage-cbm
+  labels: {app: vlgcbm, run: sage-cbm}
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels: {app: vlgcbm, run: sage-cbm}
+    spec:
+      restartPolicy: Never
+      securityContext: {runAsUser: 1000, runAsGroup: 100, fsGroup: 100, fsGroupChangePolicy: OnRootMismatch}
+      containers:
+      - name: sage
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        env:
+        - {name: PYTHONPATH, value: /workspace/VLG-CBM}
+        - {name: OUT, value: /shared/sage_cbm/w4x}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eo pipefail
+          mkdir -p /workspace/logs /shared/sage_cbm
+          exec > >(tee -a /workspace/logs/sage-cbm-$(date +%Y%m%d-%H%M%S).log) 2>&1
+          source /opt/conda/etc/profile.d/conda.sh
+          conda activate /workspace/envs/vlgcbm
+          cd /workspace/VLG-CBM
+          echo "VLG-CBM code: $(git rev-parse --short HEAD); cpus $(nproc)"
+          python -c "import model.cbm, glm_saga.elasticnet; print('VLG-CBM final-layer code ok')"
+          cp /opt/sage/concepts_kept.csv /shared/sage_cbm/concepts_kept.csv
+          A="--run_dir /shared/sae_patch16_width/w4x_l1_3e-03 --cache /shared/sae_patch16/cache --data /shared/data/birds525 --device cpu"
+
+          echo "===== 1. smoke test ====="
+          python -u -W ignore /opt/sage/sage_cbm.py $A --out /shared/sage_cbm/smoke --limit 1000 \
+            --subset all kept=/shared/sage_cbm/concepts_kept.csv --lam 0.0007 --saga_n_iters 5
+
+          echo "===== 2. main: lambda 0.0007 (VLG-CBM config) ====="
+          python -u -W ignore /opt/sage/sage_cbm.py $A --out $OUT \
+            --subset kept=/shared/sage_cbm/concepts_kept.csv all --lam 0.0007
+
+          echo "===== 3. lambda sweep (matched sparsity) ====="
+          python -u -W ignore /opt/sage/sage_cbm.py $A --out $OUT \
+            --subset kept=/shared/sage_cbm/concepts_kept.csv all --lam 0.0007 0.0015 0.003
+          echo "===== all done ====="
+        volumeMounts:
+        - {name: ml-storage, mountPath: /workspace}
+        - {name: shared, mountPath: /shared}
+        - {name: script, mountPath: /opt/sage}
+        - {name: dshm, mountPath: /dev/shm}
+        resources:
+          requests: {cpu: "16", memory: 48Gi, ephemeral-storage: 10Gi}
+          limits: {cpu: "16", memory: 48Gi, ephemeral-storage: 10Gi}
+      volumes:
+      - name: ml-storage
+        persistentVolumeClaim: {claimName: vlgcbm-workspace}
+      - name: shared
+        persistentVolumeClaim: {claimName: ayush-shared}
+      - name: script
+        configMap: {name: sage-cbm-script}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 2Gi}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: topology.kubernetes.io/region, operator: In, values: [us-west]}
