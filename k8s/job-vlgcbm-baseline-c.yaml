@@ -1,0 +1,127 @@
+# VLG-CBM baseline for SAGE-CBM: same backbone (torchvision ViT-B/16, ImageNet-1k), same
+# cleaned Birds-525 (524 classes, same split roles), same final layer (GLM-SAGA, lambda 0.0007
+# and the same sweep), standard Birds-525 concept set. Only the concept layer differs: a CBL
+# trained on Grounding DINO labels from the CLS token.
+#
+# Stages (each skipped when done; resubmit after an eviction):
+#   1. preflight  code, backbone weights
+#   2. remap      the existing DINO annotations onto the cleaned copy by image content
+#                 (scripts/remap_annotations.py), no re-annotation; ~10-20 min
+#   3. train      train_cbm.py --config configs/birds525c_v2_vitb16in1k.json; ~2-4 h
+#   4. sweep      final layer only (--load_dir), lambda 0.0015 and 0.003, for matched sparsity
+#   5. copy       metrics to /shared/sage_cbm/vlgcbm_baseline/
+#
+# Needs vlgcbm-workspace, so it starts once the SAGE-CBM job releases it.
+# Submit:  kubectl apply -f k8s/job-vlgcbm-baseline-c.yaml
+# Watch:   kubectl logs -f job/vlgcbm-baseline-c -c train | grep -E "=====|matched|accuracy|FATAL|Traceback"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vlgcbm-baseline-c
+  labels: {app: vlgcbm, run: vlgcbm-baseline-c}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 43200
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels: {app: vlgcbm, run: vlgcbm-baseline-c}
+    spec:
+      restartPolicy: Never
+      securityContext: {runAsUser: 1000, runAsGroup: 100, fsGroup: 100, fsGroupChangePolicy: OnRootMismatch}
+      containers:
+      - name: train
+        image: gitlab-registry.nrp-nautilus.io/nrp/scientific-images/python
+        env:
+        - {name: HF_HOME, value: /workspace/.cache/huggingface}
+        - {name: TORCH_HOME, value: /workspace/.cache/torch}
+        - {name: DATASET_FOLDER, value: /workspace/VLG-CBM/datasets}
+        - {name: BIRDS525C_ROOT, value: /shared/data/birds525}
+        - {name: CODE_REF, value: origin/bioclip-birds525}
+        - {name: CONFIG, value: configs/birds525c_v2_vitb16in1k.json}
+        - {name: OUT, value: /shared/sage_cbm/vlgcbm_baseline}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -eo pipefail
+          mkdir -p /workspace/logs
+          exec > >(tee -a /workspace/logs/vlgcbm-baseline-c-$(date +%Y%m%d-%H%M%S).log) 2>&1
+
+          echo "===== 1. preflight ====="
+          nvidia-smi --query-gpu=name,memory.total --format=csv
+          source /opt/conda/etc/profile.d/conda.sh
+          conda activate /workspace/envs/vlgcbm
+          cd /workspace/VLG-CBM
+          git fetch -q origin
+          for f in $(git diff --name-only --diff-filter=A HEAD "$CODE_REF"); do
+            if [ -f "$f" ] && ! git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "setting aside untracked $f"; mv "$f" "/workspace/logs/$(basename "$f").untracked-$(date +%Y%m%d-%H%M%S)"
+            fi
+          done
+          git merge --ff-only "$CODE_REF" || { echo "FATAL: checkout cannot fast-forward to $CODE_REF"; git status --short; exit 1; }
+          echo "code: $(git rev-parse --short HEAD)"
+          python -c "import data.utils as u; m, p = u.get_target_model('vit_b16_in1k', 'cpu'); import torch; print('backbone ok, CLS dim', m(torch.zeros(1,3,224,224)).shape)"
+
+          echo "===== 2. remap annotations ====="
+          if [ -f annotations_birds525c/remap.json ]; then echo "already remapped, skipping"; else
+            python -u -m scripts.remap_annotations --old_root datasets/birds525 --old_ann annotations \
+              --old birds525_train=train birds525_val=val birds525_valid=test \
+              --new_root "$BIRDS525C_ROOT" --new birds525c_train=train birds525c_valid=validation birds525c_val=test \
+              --out annotations_birds525c
+          fi
+          for s in train valid val; do echo "  birds525c_$s: $(ls annotations_birds525c/birds525c_$s | wc -l) annotation files"; done
+
+          echo "===== 3. train (lambda 0.0007) ====="
+          parent=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['save_dir'])" "$CONFIG")
+          run=$(ls -d "$parent"/*/ 2>/dev/null | while read d; do [ -f "$d/metrics.txt" ] && echo "$d"; done | tail -1)
+          if [ -n "$run" ]; then echo "trained: $run, skipping"; else
+            python train_cbm.py --config "$CONFIG"
+            run=$(ls -d "$parent"/*/ | while read d; do [ -f "$d/metrics.txt" ] && echo "$d"; done | tail -1)
+          fi
+          echo "run: $run"
+
+          echo "===== 4. final-layer sweep (matched sparsity) ====="
+          for lam in 0.0015 0.003; do
+            sweep="${parent}_lam${lam}"
+            if ls "$sweep"/*/metrics.txt >/dev/null 2>&1; then echo "lambda $lam done, skipping"; continue; fi
+            python train_cbm.py --config "$CONFIG" --load_dir "$run" --saga_lam "$lam" --save_dir "$sweep"
+          done
+
+          echo "===== 5. copy results ====="
+          mkdir -p "$OUT"
+          for d in "$parent" "${parent}"_lam*; do
+            for m in "$d"/*/metrics.txt; do
+              [ -f "$m" ] || continue
+              dst="$OUT/$(basename "$d")"; mkdir -p "$dst"; cp "$m" "$dst/metrics.txt"; cp "$(dirname "$m")/final.pt" "$dst/" 2>/dev/null || true
+              python -c "
+          import json,sys; m=json.load(open(sys.argv[1])); s=m['sparsity']
+          print(sys.argv[2], '| test acc', m['metrics']['test_accuracy'], '| lam', m['lam'], '| nonzero', s['Non-zero weights'], '| per class', round(s['Non-zero weights']/524, 2))" "$m" "$(basename "$d")"
+            done
+          done
+          echo "===== all done ====="
+        volumeMounts:
+        - {name: ml-storage, mountPath: /workspace}
+        - {name: shared, mountPath: /shared}
+        - {name: dshm, mountPath: /dev/shm}
+        resources:
+          requests: {cpu: "8", memory: 32Gi, ephemeral-storage: 10Gi, nvidia.com/gpu: "1"}
+          limits: {cpu: "8", memory: 32Gi, ephemeral-storage: 10Gi, nvidia.com/gpu: "1"}
+      volumes:
+      - name: ml-storage
+        persistentVolumeClaim: {claimName: vlgcbm-workspace}
+      - name: shared
+        persistentVolumeClaim: {claimName: ayush-shared}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 8Gi}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: topology.kubernetes.io/region, operator: In, values: [us-west]}
+              - key: nvidia.com/gpu.product
+                operator: In
+                values: [NVIDIA-GeForce-RTX-2080-Ti, NVIDIA-GeForce-RTX-3090, NVIDIA-GeForce-RTX-4090, NVIDIA-A10,
+                         NVIDIA-RTX-A4000, NVIDIA-RTX-A5000, NVIDIA-RTX-A6000, NVIDIA-TITAN-RTX, Quadro-RTX-6000,
+                         NVIDIA-L4, NVIDIA-L40, NVIDIA-L40S, NVIDIA-A40, NVIDIA-RTX-5000-Ada-Generation,
+                         NVIDIA-RTX-4000-Ada-Generation]

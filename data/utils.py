@@ -25,6 +25,8 @@ BIOCLIP_HUB = os.environ.get("VLGCBM_BIOCLIP_HUB", "hf-hub:imageomics/bioclip")
 # a staged file. Note it is ViT-L/14: 1024-d and ~3x the forward cost of BioCLIP 1.
 BIOCLIP2_HUB = os.environ.get("VLGCBM_BIOCLIP2_HUB", "hf-hub:imageomics/bioclip-2")
 
+BIRDS525C_ROOT = os.environ.get("BIRDS525C_ROOT", "/shared/data/birds525")
+
 DATASET_ROOTS = {
     "imagenet_train": f"{DATASET_FOLDER}/imagenet/ILSVRC/Data/CLS-LOC/train",
     "imagenet_val": f"{DATASET_FOLDER}/imagenet/ILSVRC/Data/CLS-LOC/ImageNet_val",
@@ -45,6 +47,13 @@ DATASET_ROOTS = {
     # First 5 classes of birds525, symlinked. Annotating and training on it takes
     # minutes, so it is the end-to-end check to run before the multi-hour birds525
     # jobs. See scripts/make_smoke_dataset.sh.
+    # Cleaned Birds-525 (scripts/prepare_birds525.py: no Looney Birds, 524 classes), with the
+    # split roles of the SAGE-CBM runs so the two are directly comparable: validation/ is the
+    # validation split (VLG-CBM's `_valid`, used with val_split=0) and test/ the test set
+    # (VLG-CBM's `_val`). Annotations: scripts/remap_annotations.py.
+    "birds525c_train": f"{BIRDS525C_ROOT}/train",
+    "birds525c_valid": f"{BIRDS525C_ROOT}/validation",
+    "birds525c_val": f"{BIRDS525C_ROOT}/test",
     "birds525mini_train": f"{DATASET_FOLDER}/birds525mini/train",
     "birds525mini_val": f"{DATASET_FOLDER}/birds525mini/val",
 }
@@ -61,6 +70,7 @@ LABEL_FILES = {
     "dtd": "concept_files/dtd_classes.txt",
     "birds525": "concept_files/birds525_classes.txt",
     "birds525mini": "concept_files/birds525mini_classes.txt",
+    "birds525c": "concept_files/birds525c_classes.txt",
     "treeoflife": "concept_files/treeoflife_classes.txt",
 }
 
@@ -82,6 +92,10 @@ BACKBONE_ENCODING_DIMENSION = {
     # entry because BackboneCLIP's penultimate path rewrites visual.attnpool, which
     # only exists on CLIP's ResNet towers -- use_clip_penultimate must stay false here.
     "clip_ViT-B/16": 512,
+    # torchvision ViT-B/16, ImageNet-1k: the backbone of the SAGE-CBM patch SAE, so the
+    # VLG-CBM baseline on it differs from SAGE-CBM only in the concept layer. CLS token
+    # after the final LayerNorm (heads replaced by Identity; hook feature_layer "heads").
+    "vit_b16_in1k": 768,
 }
 
 BACKBONE_VISUALIZATION_TARGET_LAYER = {
@@ -391,6 +405,13 @@ def get_target_model(target_name, device):
         target_model = ptcv_get_model("resnet18_cub", pretrained=True).to(device)
         target_model.eval()
         preprocess = get_resnet_imagenet_preprocess()
+
+    elif target_name == "vit_b16_in1k":
+        weights = models.ViT_B_16_Weights.IMAGENET1K_V1
+        target_model = models.vit_b_16(weights=weights)
+        target_model.heads = torch.nn.Identity()
+        target_model = target_model.to(device).eval()
+        preprocess = weights.transforms()
 
     elif target_name.endswith("_v2"):
         target_name = target_name[:-3]
